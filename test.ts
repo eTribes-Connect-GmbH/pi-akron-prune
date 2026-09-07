@@ -1,0 +1,271 @@
+/**
+ * akron-prune — functional test for the core pruning pipeline.
+ *
+ * Runs a synthetic conversation through the real modules:
+ * batch computation → prune execution (artifacts + index) → context
+ * rewrite → recovery → integrity validation. Executed with `bun run
+ * test.ts` from the extension directory (bun resolves the .js→.ts
+ * import specifiers; the modules under test only use node builtins).
+ *
+ * This file is NOT loaded by pi — extension auto-discovery only loads
+ * index.ts. It exists so the deterministic core can be tested without
+ * an LLM in the loop.
+ */
+
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { cacheProfileFile, DEFAULT_CONFIG, profileFile, type AkronConfig } from "./config.js";
+import { computeBatches, pendingFrom } from "./batches.js";
+import { applyIndex } from "./rewrite.js";
+import { runPrune } from "./prune.js";
+import { ArtifactStore } from "./store.js";
+import { buildCacheProfileRecord, formatStatusLine, readCacheProfilesForSession, summarizeCacheProfiles } from "./stats.js";
+import type { AnyMessage } from "./batches.js";
+
+const originalProfile = existsSync(profileFile()) ? readFileSync(profileFile(), "utf8") : undefined;
+const originalCacheProfile = existsSync(cacheProfileFile()) ? readFileSync(cacheProfileFile(), "utf8") : undefined;
+process.on("exit", () => {
+	if (originalProfile === undefined) rmSync(profileFile(), { force: true });
+	else writeFileSync(profileFile(), originalProfile);
+	if (originalCacheProfile === undefined) rmSync(cacheProfileFile(), { force: true });
+	else writeFileSync(cacheProfileFile(), originalCacheProfile);
+});
+
+const BIG = "x".repeat(5000);
+const LONG_CMD = `cat ${"f".repeat(900)}.txt`;
+
+const messages: AnyMessage[] = [
+	{ role: "user", content: "please do things", timestamp: 1 },
+	{
+		role: "assistant",
+		content: [
+			{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "ls" } },
+		],
+		timestamp: 2,
+	},
+	{ role: "toolResult", toolCallId: "t1", toolName: "bash", content: [{ type: "text", text: "a.txt b.txt" }], isError: false, timestamp: 3 },
+	{
+		role: "assistant",
+		content: [
+			{ type: "toolCall", id: "t2", name: "write", arguments: { path: "/tmp/out.txt", content: BIG } },
+		],
+		timestamp: 4,
+	},
+	{ role: "toolResult", toolCallId: "t2", toolName: "write", content: [{ type: "text", text: "updated" }], isError: false, timestamp: 5 },
+	{
+		role: "assistant",
+		content: [
+			{ type: "toolCall", id: "t3", name: "bash", arguments: { command: LONG_CMD } },
+		],
+		timestamp: 6,
+	},
+	{ role: "toolResult", toolCallId: "t3", toolName: "bash", content: [{ type: "text", text: BIG }], isError: false, timestamp: 7 },
+	{
+		role: "user",
+		content: [
+			{ type: "text", text: "look at this screenshot:" },
+			{ type: "image", data: Buffer.from("fake-png-bytes").toString("base64"), mimeType: "image/png" },
+		],
+		timestamp: 8,
+	},
+	{
+		role: "assistant",
+		content: [
+			{ type: "toolCall", id: "t4", name: "read", arguments: { path: "README.md" } },
+		],
+		timestamp: 9,
+	},
+	{ role: "toolResult", toolCallId: "t4", toolName: "read", content: [{ type: "text", text: BIG }], isError: false, timestamp: 10 },
+	{ role: "assistant", content: [{ type: "text", text: "all done" }], timestamp: 11 },
+];
+
+let failures = 0;
+function check(name: string, cond: boolean, detail = ""): void {
+	if (cond) {
+		console.log(`  ✓ ${name}`);
+	} else {
+		failures++;
+		console.error(`  ✗ ${name}${detail ? ` — ${detail}` : ""}`);
+	}
+}
+
+const cfg: AkronConfig = { ...DEFAULT_CONFIG };
+const root = mkdtempSync(join(tmpdir(), "akron-test-"));
+const store = ArtifactStore.open(root, "test-session");
+const index = store.loadIndex("test-session");
+
+console.log("1. batch computation");
+const batches = computeBatches(messages, index, cfg);
+check("3 eligible batches (t2, t3, user image)", batches.length === 3, `got ${batches.length}`);
+check("all batches complete", batches.every((b) => b.complete));
+const t2Batch = batches.find((b) => b.anchorKey === "t2");
+const t3Batch = batches.find((b) => b.anchorKey === "t3");
+const imgBatch = batches.find((b) => b.anchorIsUser);
+check("t2 batch: write args item only", !!t2Batch && t2Batch.items.length === 1 && t2Batch.items[0].kind === "args");
+check(
+	"t3 batch: result + args items",
+	!!t3Batch && t3Batch.items.length === 2 && t3Batch.items.some((i) => i.kind === "result") && t3Batch.items.some((i) => i.kind === "args"),
+);
+check("image batch present", !!imgBatch && imgBatch.items.length === 1 && imgBatch.items[0].kind === "userImage");
+check("read of .md is preserved", !batches.some((b) => b.anchorKey === "t4"));
+check("small bash result not prunable", !batches.some((b) => b.anchorKey === "t1"));
+
+console.log("2. prune execution");
+const pending = pendingFrom(batches, 0);
+const stats = await runPrune({ store, index, cfg, batches: pending.batches, cwd: process.cwd(), sessionId: "test-session", trigger: "manual" });
+check("4 items pruned", stats.items === 4, `got ${stats.items}`);
+check("no failures", stats.failures === 0);
+check("3 batches counted", stats.batches === 3, `got ${stats.batches}`);
+check("charsPruned > 0", stats.charsPruned > 10_000);
+check("index has 4 entries", Object.keys(index.entries).length === 4);
+check("checkpoint recorded", index.checkpoints.length === 1);
+check("checkpoint anchored at t2", index.checkpoints[0].anchorKey === "t2");
+check("git snapshot in checkpoint", index.checkpoints[0].text.includes("git:"));
+
+console.log("3. artifacts on disk");
+const t3Entry = index.entries["tc:t3"];
+check("t3 artifact exists", !!t3Entry && existsSync(t3Entry.files[0].path));
+check("artifact content matches original", readFileSync(t3Entry.files[0].path, "utf8") === BIG);
+const imgEntry = index.entries[imgBatch!.anchorKey];
+check("image artifact written", !!imgEntry && existsSync(imgEntry.files[0].path));
+check(
+	"image artifact content round-trips",
+	readFileSync(imgEntry.files[0].path).toString("base64") === Buffer.from("fake-png-bytes").toString("base64"),
+);
+
+console.log("4. context rewrite");
+const { messages: rewritten, changed } = applyIndex(messages, index);
+check("rewrite reports change", changed);
+const t3Result = rewritten.find((m) => m.role === "toolResult" && m.toolCallId === "t3");
+check(
+	"t3 result replaced with reference",
+	!!t3Result &&
+		(t3Result.content as Array<{ type: string; text?: string }>)[0].type === "text" &&
+		(t3Result.content as Array<{ type: string; text?: string }>)[0].text!.includes("akron-pruned") &&
+		(t3Result.content as Array<{ type: string; text?: string }>)[0].text!.includes("akron_recover"),
+);
+const t2Assistant = rewritten.find((m) => m.role === "assistant" && (m.content as Array<{ id?: string }>).some((b) => b.id === "t2"));
+const t2Call = (t2Assistant!.content as Array<{ type: string; id?: string; arguments?: Record<string, unknown> }>).find((b) => b.id === "t2")!;
+check("write args stubbed", typeof t2Call.arguments === "object" && "_akron_pruned" in t2Call.arguments && t2Call.arguments.path === "/tmp/out.txt");
+check("write result untouched (short)", rewritten.find((m) => m.role === "toolResult" && m.toolCallId === "t2")!.content === messages[4].content);
+const t1Result = rewritten.find((m) => m.role === "toolResult" && m.toolCallId === "t1");
+check("small result untouched", t1Result === messages[2]);
+const t4Result = rewritten.find((m) => m.role === "toolResult" && m.toolCallId === "t4");
+check("preserved .md read untouched", t4Result === messages[9]);
+const imgMsg = rewritten.find((m) => m.timestamp === 8);
+check(
+	"user image replaced with text ref",
+	!!imgMsg && (imgMsg.content as Array<{ type: string; text?: string }>).every((b) => b.type === "text"),
+);
+const cpIdx = rewritten.findIndex((m) => m.role === "user" && typeof m.content === "string" && (m.content as string).startsWith("[akron checkpoint"));
+const t2AssistantIdx = rewritten.indexOf(t2Assistant!);
+check("checkpoint inserted before first pruned batch", cpIdx !== -1 && cpIdx < t2AssistantIdx, `cp at ${cpIdx}, t2 at ${t2AssistantIdx}`);
+
+console.log("5. determinism");
+const second = applyIndex(messages, index);
+check("rewrite is deterministic", JSON.stringify(second.messages) === JSON.stringify(rewritten));
+check("re-compute finds no new pending", computeBatches(messages, index, cfg).length === 0);
+
+console.log("6. recovery");
+const blocks = store.readArtifactBlocks(t3Entry.files[0].path);
+check("text artifact recovers as text block", blocks.length === 1 && blocks[0].type === "text" && blocks[0].text === BIG);
+const imgBlocks = store.readArtifactBlocks(imgEntry.files[0].path);
+check("image artifact recovers as image block", imgBlocks.length === 1 && imgBlocks[0].type === "image" && imgBlocks[0].mimeType === "image/png");
+check("resolveArtifactPath rejects outside paths", store.resolveArtifactPath("/etc/passwd") === null);
+
+console.log("7. integrity validation");
+const corrupted = t3Entry.files[0].path;
+writeFileSync(corrupted, "tampered");
+const { dropped } = store.validateEntries(index);
+check("tampered artifact drops its entry", dropped === 1 && index.entries["tc:t3"] === undefined);
+const afterDrop = applyIndex(messages, index);
+const t3ResultRestored = afterDrop.messages.find((m) => m.role === "toolResult" && m.toolCallId === "t3");
+check("dropped entry falls back to original in context", t3ResultRestored === messages[6]);
+
+console.log("8. cache profiling stats");
+const cacheRecord = buildCacheProfileRecord(
+	{
+		role: "assistant",
+		provider: "anthropic",
+		model: "claude-opus-5",
+		api: "anthropic-messages",
+		stopReason: "toolUse",
+		timestamp: 12,
+		usage: {
+			input: 100,
+			output: 25,
+			cacheRead: 900,
+			cacheWrite: 50,
+			totalTokens: 1075,
+			cost: { input: 0.01, output: 0.02, cacheRead: 0.003, cacheWrite: 0.004, total: 0.037 },
+		},
+	},
+	index,
+	"test-session",
+);
+check("assistant usage creates cache profile record", !!cacheRecord);
+check("cache profile preserves observed token counts", cacheRecord?.cacheRead === 900 && cacheRecord.cacheWrite === 50);
+check("cache profile snapshots prune state", cacheRecord?.prunedEntries === Object.keys(index.entries).length && cacheRecord.prunedChars > 0);
+check("messages without usage are skipped", buildCacheProfileRecord({ role: "assistant", timestamp: 13 }, index, "test-session") === null);
+const firstCacheRecord = cacheRecord ?? {
+	ts: 12,
+	sessionId: "test-session",
+	provider: "anthropic",
+	model: "claude-opus-5",
+	input: 100,
+	output: 25,
+	cacheRead: 900,
+	cacheWrite: 50,
+	totalTokens: 1075,
+	prunedEntries: Object.keys(index.entries).length,
+	checkpoints: index.checkpoints.length,
+	prunedChars: 1,
+};
+const secondCacheRecord = {
+	ts: 13,
+	sessionId: "test-session",
+	provider: "anthropic",
+	model: "claude-opus-5",
+	input: 200,
+	output: 30,
+	cacheRead: 800,
+	cacheWrite: 0,
+	totalTokens: 1030,
+	cost: { total: 0.04 },
+	prunedEntries: 3,
+	checkpoints: 1,
+	prunedChars: 123,
+};
+const cacheSummary = summarizeCacheProfiles([firstCacheRecord, secondCacheRecord]);
+check("cache summary counts requests", cacheSummary.requests === 2);
+check("cache summary computes hit ratio", cacheSummary.cacheHitRatio === 1700 / 2050, `got ${cacheSummary.cacheHitRatio}`);
+check("cache summary groups by model", cacheSummary.perModel.length === 1 && cacheSummary.perModel[0].requests === 2);
+const status = formatStatusLine(
+	{ batches: [{}], items: 3, chars: 12_000 },
+	[firstCacheRecord, secondCacheRecord],
+	{ tokens: 1_000, contextWindow: 20_000 },
+	5_000,
+);
+check("status line shows cache hit rate", status.includes("↻82.9%"), status);
+check("status line shows cache-read tokens", status.includes("⧉1.7k"), status);
+check("status line shows compaction headroom", status.includes("⏳14k"), status);
+check("status line shows pending backlog", status.includes("✂3/12k"), status);
+writeFileSync(
+	cacheProfileFile(),
+	[
+		JSON.stringify({ ...firstCacheRecord, sessionId: "other-session", ts: 1 }),
+		JSON.stringify({ ...firstCacheRecord, ts: 2 }),
+		"not json",
+		JSON.stringify({ ...firstCacheRecord, ts: 3 }),
+		JSON.stringify({ ...secondCacheRecord, ts: 4 }),
+	].join("\n") + "\n",
+);
+const latestCacheRecords = readCacheProfilesForSession("test-session", 2);
+check("cache profile tail reader returns only requested session", latestCacheRecords.every((record) => record.sessionId === "test-session"));
+check("cache profile tail reader returns latest matching records", latestCacheRecords.map((record) => record.ts).join(",") === "3,4");
+check("cache profile tail reader honors zero limit", readCacheProfilesForSession("test-session", 0).length === 0);
+
+rmSync(root, { recursive: true, force: true });
+console.log(failures === 0 ? "\nALL CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
+process.exit(failures === 0 ? 0 : 1);

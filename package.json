@@ -1,0 +1,16 @@
+{
+  "name": "akron-prune",
+  "version": "0.1.0",
+  "description": "Lossless context pruning for pi — completed tool activity is written to durable, hash-verified artifacts and replaced with deterministic references; includes a three-arm pruning benchmark.",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "26.4.1"
+  }
+}
