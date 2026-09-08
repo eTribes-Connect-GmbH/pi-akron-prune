@@ -4,7 +4,6 @@
  * Executes one prune event over a list of pending batches (oldest first):
  *
  *   1. write each item to a durable, hash-verified artifact
- *      (file mutations are the exception — the file on disk IS the artifact)
  *   2. record a deterministic reference/stub in the session's prune index
  *   3. capture a git checkpoint at the pruning boundary
  *   4. persist the index, then append a profiling record
@@ -18,7 +17,7 @@ import { gitSnapshot } from "./checkpoint.js";
 import { argsChars, sanitizeId } from "./batches.js";
 import { appendProfile, type ArtifactStore } from "./store.js";
 import type { AkronConfig } from "./config.js";
-import type { Batch, BatchItem, PruneEntry, PruneIndex, PruneStats } from "./types.js";
+import type { ArtifactFile, Batch, BatchItem, PruneEntry, PruneIndex, PruneStats } from "./types.js";
 
 function fmtK(n: number): string {
 	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -26,11 +25,16 @@ function fmtK(n: number): string {
 	return String(n);
 }
 
+function artifactLocation(files: ArtifactFile[]): string {
+	const first = files[0]?.path ?? "";
+	return files.length === 1 ? `original saved to ${first}` : `original saved across ${files.length} ordered artifacts starting at ${first}`;
+}
+
 /**
  * Stubs file-mutation arguments: keeps small, useful scalars (path, flags)
- * and drops bulk content, pointing at the file on disk instead.
+ * and drops bulk content, pointing at the exact argument artifact.
  */
-function stubMutationArgs(toolName: string, input: unknown): { stub: Record<string, unknown>; note: string } {
+function stubMutationArgs(toolName: string, input: unknown, artifactPath: string): { stub: Record<string, unknown>; note: string } {
 	const stub: Record<string, unknown> = {};
 	for (const [k, v] of Object.entries((input as Record<string, unknown>) ?? {})) {
 		if (typeof v === "string" && v.length > 200) continue; // bulk content — dropped
@@ -38,9 +42,30 @@ function stubMutationArgs(toolName: string, input: unknown): { stub: Record<stri
 		stub[k] = v; // path, line hints, small options
 	}
 	const path = String((input as { path?: string } | undefined)?.path ?? "file");
-	const note = `[akron-pruned: ${toolName} arguments omitted — change applied to ${path}; the file on disk is the source of truth]`;
+	const note = `[akron-pruned: ${toolName} arguments omitted — change applied to ${path}; exact arguments saved to ${artifactPath}]`;
 	stub._akron_pruned = note;
 	return { stub, note };
+}
+
+function argumentBlocks(toolName: string | undefined, input: unknown): Array<{ type: "text"; text: string }> {
+	return [{ type: "text", text: JSON.stringify({ tool: toolName, arguments: input ?? {} }, null, 2) }];
+}
+
+function argumentFiles(item: BatchItem, store: ArtifactStore): ArtifactFile[] {
+	return store.writeArtifact(`tc-${sanitizeId(item.toolCallId ?? item.key)}-args`, argumentBlocks(item.toolName, item.input));
+}
+
+function pairCallFiles(item: BatchItem, store: ArtifactStore): ArtifactFile[] {
+	if (item.rewrite !== "removePair") return [];
+	if (!item.pairCall) throw new Error(`missing tool call for removed pair ${item.key}`);
+	return store.writeArtifact(`tc-${sanitizeId(item.toolCallId ?? item.key)}-call`, [
+		{ type: "text", text: JSON.stringify(item.pairCall, null, 2) },
+	]);
+}
+
+function pairResultFiles(item: BatchItem, store: ArtifactStore): ArtifactFile[] {
+	if (item.rewrite !== "removePair" || !item.pairResultBlocks?.length) return [];
+	return store.writeArtifact(`tc-${sanitizeId(item.toolCallId ?? item.key)}`, item.pairResultBlocks as never);
 }
 
 interface PruneItemOutcome {
@@ -55,11 +80,11 @@ async function pruneItem(
 ): Promise<PruneItemOutcome> {
 	if (item.kind === "result") {
 		const files = store.writeArtifact(`tc-${sanitizeId(item.toolCallId ?? item.key)}`, (item.blocks ?? []) as never);
-		const main = files[0]?.path ?? "";
+		const hiddenFiles = pairCallFiles(item, store);
 		const errNote = item.isError ? ", error output" : "";
 		const refText =
 			`[akron-pruned: ${item.toolName} result (~${fmtK(item.chars)} chars${errNote}) — ` +
-			`original saved to ${main}. Recover with the akron_recover tool (ref=${item.toolCallId}) or read the file.]`;
+			`${artifactLocation(files)}. Recover all with the akron_recover tool (ref=${item.toolCallId}) or read individual files.]`;
 		return {
 			entry: {
 				kind: "result",
@@ -67,6 +92,7 @@ async function pruneItem(
 				toolCallId: item.toolCallId,
 				ts: now,
 				files,
+				hiddenFiles: hiddenFiles.length ? hiddenFiles : undefined,
 				refText,
 				rewrite: item.rewrite,
 				pruneReason: item.pruneReason,
@@ -79,14 +105,11 @@ async function pruneItem(
 	if (item.kind === "args") {
 		const input = (item.input ?? {}) as Record<string, unknown>;
 
-		// file mutations: ordinary pruning keeps a stub; removed pairs still persist exact args as a hidden artifact
+		// file mutations: ordinary pruning keeps a stub; exact args are still durable artifacts
 		if (cfg.mutationTools.includes(item.toolName ?? "")) {
-			const { stub, note } = stubMutationArgs(item.toolName ?? "write", input);
-			const files = item.rewrite === "removePair"
-				? store.writeArtifact(`tc-${sanitizeId(item.toolCallId ?? item.key)}-args`, [
-					{ type: "text", text: JSON.stringify({ tool: item.toolName, arguments: input }, null, 2) },
-				])
-				: [];
+			const files = item.rewrite === "removePair" ? pairCallFiles(item, store) : argumentFiles(item, store);
+			const hiddenFiles = pairResultFiles(item, store);
+			const { stub, note } = stubMutationArgs(item.toolName ?? "write", input, files[0]?.path ?? "");
 			return {
 				entry: {
 					kind: "args",
@@ -94,7 +117,8 @@ async function pruneItem(
 					toolCallId: item.toolCallId,
 					ts: now,
 					files,
-					refText: files[0] ? `[akron-pruned: ${item.toolName} pair removed — arguments saved to ${files[0].path}]` : note,
+					hiddenFiles: hiddenFiles.length ? hiddenFiles : undefined,
+					refText: item.rewrite === "removePair" ? `[akron-pruned: ${item.toolName} pair removed — arguments saved to ${files[0]?.path ?? "artifact"}]` : note,
 					rewrite: item.rewrite,
 					pruneReason: item.pruneReason,
 					stubArgs: item.rewrite === "removePair" ? undefined : stub,
@@ -104,9 +128,7 @@ async function pruneItem(
 		}
 
 		// huge bash commands: artifact the full command, keep a prefix stub
-		const files = store.writeArtifact(`tc-${sanitizeId(item.toolCallId ?? item.key)}-args`, [
-			{ type: "text", text: JSON.stringify({ tool: item.toolName, arguments: input }, null, 2) },
-		]);
+		const files = argumentFiles(item, store);
 		const command = String(input.command ?? "");
 		const stub: Record<string, unknown> = { ...input };
 		stub.command = `${command.slice(0, 160)}\n… [akron-pruned: full command saved to ${files[0].path}]`;

@@ -12,6 +12,7 @@
  * an LLM in the loop.
  */
 
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +20,7 @@ import { cacheProfileFile, DEFAULT_CONFIG, profileFile, type AkronConfig } from 
 import { computeBatches, pendingFrom } from "./batches.js";
 import { applyIndex } from "./rewrite.js";
 import { runPrune } from "./prune.js";
+import { hasUnmeasuredPrune, recoveryFiles } from "./index.js";
 import { ArtifactStore } from "./store.js";
 import { buildCacheProfileRecord, formatStatusLine, readCacheProfilesForSession, summarizeCacheProfiles } from "./stats.js";
 import type { AnyMessage } from "./batches.js";
@@ -126,12 +128,15 @@ check("git snapshot in checkpoint", index.checkpoints[0].text.includes("git:"));
 console.log("3. artifacts on disk");
 const t3Entry = index.entries["tc:t3"];
 check("t3 artifact exists", !!t3Entry && existsSync(t3Entry.files[0].path));
-check("artifact content matches original", readFileSync(t3Entry.files[0].path, "utf8") === BIG);
+const t3ArtifactBlocks = store.readArtifactBlocks(t3Entry.files[0]);
+check("artifact content matches original", t3ArtifactBlocks.length === 1 && t3ArtifactBlocks[0].type === "text" && t3ArtifactBlocks[0].text === BIG);
+check("single text artifact stays directly readable", t3Entry.files[0].path.endsWith(".txt") && readFileSync(t3Entry.files[0].path, "utf8") === BIG);
 const imgEntry = index.entries[imgBatch!.anchorKey];
 check("image artifact written", !!imgEntry && existsSync(imgEntry.files[0].path));
+const imageArtifactBlocks = store.readArtifactBlocks(imgEntry.files[0]);
 check(
 	"image artifact content round-trips",
-	readFileSync(imgEntry.files[0].path).toString("base64") === Buffer.from("fake-png-bytes").toString("base64"),
+	imageArtifactBlocks.length === 1 && imageArtifactBlocks[0].type === "image" && imageArtifactBlocks[0].data === Buffer.from("fake-png-bytes").toString("base64"),
 );
 
 console.log("4. context rewrite");
@@ -148,6 +153,8 @@ check(
 const t2Assistant = rewritten.find((m) => m.role === "assistant" && (m.content as Array<{ id?: string }>).some((b) => b.id === "t2"));
 const t2Call = (t2Assistant!.content as Array<{ type: string; id?: string; arguments?: Record<string, unknown> }>).find((b) => b.id === "t2")!;
 check("write args stubbed", typeof t2Call.arguments === "object" && "_akron_pruned" in t2Call.arguments && t2Call.arguments.path === "/tmp/out.txt");
+const t2ArgsEntry = index.entries["tc:t2:args"];
+check("write args artifacted", !!t2ArgsEntry?.files[0] && readFileSync(t2ArgsEntry.files[0].path, "utf8").includes(BIG));
 check("write result untouched (short)", rewritten.find((m) => m.role === "toolResult" && m.toolCallId === "t2")!.content === messages[4].content);
 const t1Result = rewritten.find((m) => m.role === "toolResult" && m.toolCallId === "t1");
 check("small result untouched", t1Result === messages[2]);
@@ -166,6 +173,9 @@ console.log("5. determinism");
 const second = applyIndex(messages, index);
 check("rewrite is deterministic", JSON.stringify(second.messages) === JSON.stringify(rewritten));
 check("re-compute finds no new pending", computeBatches(messages, index, cfg).length === 0);
+check("fresh prune generation defers threshold compaction", hasUnmeasuredPrune(index));
+index.measuredPruneTs = Math.max(...Object.values(index.entries).map((entry) => entry.ts));
+check("measured prune generation permits threshold compaction", !hasUnmeasuredPrune(index));
 
 console.log("6. pressure/budget selection");
 const fakeBatches = Array.from({ length: 5 }, (_, i) => ({
@@ -186,8 +196,12 @@ console.log("7. redundant recent removal");
 const SCREENSHOT = Buffer.alloc(5000, 7).toString("base64");
 const redundantMessages: AnyMessage[] = [
 	{ role: "user", content: "repeat and mutate", timestamp: 20 },
-	{ role: "assistant", content: [{ type: "toolCall", id: "r1", name: "read", arguments: { path: "src/a.ts" } }], timestamp: 21 },
+	{ role: "assistant", content: [
+		{ type: "toolCall", id: "r1", name: "read", arguments: { path: "src/a.ts" } },
+		{ type: "toolCall", id: "sibling", name: "bash", arguments: { command: "pwd" } },
+	], timestamp: 21 },
 	{ role: "toolResult", toolCallId: "r1", toolName: "read", content: [{ type: "text", text: BIG }], timestamp: 22 },
+	{ role: "toolResult", toolCallId: "sibling", toolName: "bash", content: [{ type: "text", text: "cwd" }], timestamp: 22 },
 	{ role: "assistant", content: [{ type: "text", text: "processed first read" }], timestamp: 23 },
 	{ role: "assistant", content: [{ type: "toolCall", id: "r2", name: "read", arguments: { path: "src/a.ts" } }], timestamp: 24 },
 	{ role: "toolResult", toolCallId: "r2", toolName: "read", content: [{ type: "text", text: BIG }], timestamp: 25 },
@@ -210,18 +224,61 @@ const redundantPending = pendingFrom(redundantBatches, 99, { includeRedundant: t
 check("redundant recent items selected", redundantPending.items === 4, `got ${redundantPending.items}`);
 await runPrune({ store: redundantStore, index: redundantIndex, cfg, batches: redundantPending.batches, cwd: process.cwd(), sessionId: "redundant-session", trigger: "redundant-test" });
 const w1ArgsEntry = redundantIndex.entries["tc:w1:args"];
+const r1Entry = redundantIndex.entries["tc:r1"];
+const br1Entry = redundantIndex.entries["tc:br1"];
+check("removed repeated read call args are artifacted", !!r1Entry?.hiddenFiles?.[0] && readFileSync(r1Entry.hiddenFiles[0].path, "utf8").includes("src/a.ts"));
+const r1EnvelopeBlock = r1Entry?.hiddenFiles?.[0] ? redundantStore.readArtifactBlocks(r1Entry.hiddenFiles[0])[0] : undefined;
+let r1Envelope: unknown;
+try {
+	r1Envelope = r1EnvelopeBlock?.type === "text" ? JSON.parse(r1EnvelopeBlock.text) : undefined;
+} catch {
+	r1Envelope = undefined;
+}
+check("pair envelope excludes sibling calls", !!r1Envelope && JSON.stringify(r1Envelope).includes('"id":"r1"') && !JSON.stringify(r1Envelope).includes('"id":"sibling"'));
+check("removed browser call args are artifacted", !!br1Entry?.hiddenFiles?.[0] && readFileSync(br1Entry.hiddenFiles[0].path, "utf8").includes("screenshot"));
+check("normal recovery excludes pair metadata", recoveryFiles(redundantIndex, redundantStore, "r1").length === r1Entry?.files.length);
+const recoveredPair = recoveryFiles(redundantIndex, redundantStore, "r1:pair");
+check("explicit pair recovery returns call then result", recoveredPair.length === 2 && readFileSync(recoveredPair[0].path, "utf8").includes('"id": "r1"') && readFileSync(recoveredPair[1].path, "utf8").includes(BIG));
 check("removed mutation args are artifacted", !!w1ArgsEntry?.files[0] && readFileSync(w1ArgsEntry.files[0].path, "utf8").includes(BIG));
+check("removed mutation result is artifacted through args entry", !!w1ArgsEntry?.hiddenFiles?.[0] && readFileSync(w1ArgsEntry.hiddenFiles[0].path, "utf8").includes(BIG));
 check("all selected w1 items remove the pair", redundantIndex.entries["tc:w1"]?.rewrite === "removePair" && w1ArgsEntry?.rewrite === "removePair");
+const w1ResultEntry = redundantIndex.entries["tc:w1"];
+if (w1ResultEntry) w1ResultEntry.rewrite = "replace";
+check("pair recovery selects removePair entry", recoveryFiles(redundantIndex, redundantStore, "w1:pair").length === 2);
+if (w1ResultEntry) w1ResultEntry.rewrite = "removePair";
 const redundantRewrite = applyIndex(redundantMessages, redundantIndex).messages;
 check("earlier repeated read pair removed", !redundantRewrite.some((m) => m.toolCallId === "r1") && !JSON.stringify(redundantRewrite).includes('"id":"r1"'));
 check("latest repeated read remains", redundantRewrite.some((m) => m.toolCallId === "r2") && JSON.stringify(redundantRewrite).includes('"id":"r2"'));
+check("sibling call remains", redundantRewrite.some((m) => m.toolCallId === "sibling") && JSON.stringify(redundantRewrite).includes('"id":"sibling"'));
 check("superseded mutation pair removed", !redundantRewrite.some((m) => m.toolCallId === "w1") && !JSON.stringify(redundantRewrite).includes('"id":"w1"'));
 check("latest mutation remains", redundantRewrite.some((m) => m.toolCallId === "w2") && JSON.stringify(redundantRewrite).includes('"id":"w2"'));
 check("consumed browser screenshot pair removed", !redundantRewrite.some((m) => m.toolCallId === "br1") && !JSON.stringify(redundantRewrite).includes('"id":"br1"'));
 check("assistant reasoning remains", redundantRewrite.some((m) => JSON.stringify(m.content).includes("processed first read")));
 rmSync(redundantRoot, { recursive: true, force: true });
 
-console.log("8. failed mutations are not supersession evidence");
+console.log("8. removed mutation pair with short result remains recoverable");
+const smallRoot = mkdtempSync(join(tmpdir(), "akron-small-mutation-"));
+const smallStore = ArtifactStore.open(smallRoot, "small-mutation-session");
+const smallIndex = smallStore.loadIndex("small-mutation-session");
+const smallMutationMessages: AnyMessage[] = [
+	{ role: "user", content: "small mutation results", timestamp: 36 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "sw1", name: "write", arguments: { path: "src/small.ts", content: BIG } }], timestamp: 37 },
+	{ role: "toolResult", toolCallId: "sw1", toolName: "write", content: [{ type: "text", text: "ok" }], timestamp: 38 },
+	{ role: "assistant", content: [{ type: "text", text: "processed first small mutation" }], timestamp: 39 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "sw2", name: "edit", arguments: { path: "src/small.ts", edits: [{ oldText: "x", newText: BIG }] } }], timestamp: 40 },
+	{ role: "toolResult", toolCallId: "sw2", toolName: "edit", content: [{ type: "text", text: "edited" }], timestamp: 41 },
+	{ role: "assistant", content: [{ type: "text", text: "processed second small mutation" }], timestamp: 42 },
+];
+const smallPending = pendingFrom(computeBatches(smallMutationMessages, smallIndex, cfg), 99, { includeRedundant: true });
+check("args-only redundant mutation selected", smallPending.items === 1, `got ${smallPending.items}`);
+await runPrune({ store: smallStore, index: smallIndex, cfg, batches: smallPending.batches, cwd: process.cwd(), sessionId: "small-mutation-session", trigger: "small-mutation-test" });
+const sw1ArgsEntry = smallIndex.entries["tc:sw1:args"];
+check("short removed mutation result is artifacted", !!sw1ArgsEntry?.hiddenFiles?.[0] && readFileSync(sw1ArgsEntry.hiddenFiles[0].path, "utf8").includes("ok"));
+const smallRewrite = applyIndex(smallMutationMessages, smallIndex).messages;
+check("short-result mutation pair removed", !smallRewrite.some((m) => m.toolCallId === "sw1") && !JSON.stringify(smallRewrite).includes('"id":"sw1"'));
+rmSync(smallRoot, { recursive: true, force: true });
+
+console.log("9. failed mutations are not supersession evidence");
 const failedRoot = mkdtempSync(join(tmpdir(), "akron-failed-mutation-"));
 const failedStore = ArtifactStore.open(failedRoot, "failed-mutation-session");
 const failedIndex = failedStore.loadIndex("failed-mutation-session");
@@ -238,23 +295,67 @@ const failedPending = pendingFrom(computeBatches(failedMutationMessages, failedI
 check("failed later mutation does not supersede earlier mutation", failedPending.items === 0, `got ${failedPending.items}`);
 rmSync(failedRoot, { recursive: true, force: true });
 
-console.log("9. recovery");
+console.log("10. signed tool turns remain provider-valid");
+const signedRoot = mkdtempSync(join(tmpdir(), "akron-signed-turn-"));
+const signedStore = ArtifactStore.open(signedRoot, "signed-turn-session");
+const signedIndex = signedStore.loadIndex("signed-turn-session");
+const signedMessages: AnyMessage[] = [
+	{ role: "assistant", content: [
+		{ type: "text", text: "signed reasoning", textSignature: "opaque" },
+		{ type: "toolCall", id: "sg1", name: "read", arguments: { path: "src/signed.ts" } },
+		{ type: "toolCall", id: "sg2", name: "read", arguments: { path: "src/signed.ts" } },
+	], timestamp: 47 },
+	{ role: "toolResult", toolCallId: "sg1", toolName: "read", content: [{ type: "text", text: BIG }], timestamp: 48 },
+	{ role: "toolResult", toolCallId: "sg2", toolName: "read", content: [{ type: "text", text: BIG }], timestamp: 49 },
+	{ role: "assistant", content: [{ type: "text", text: "processed signed calls" }], timestamp: 50 },
+];
+const signedBatches = computeBatches(signedMessages, signedIndex, cfg);
+check("signed parallel calls are not pair-removal candidates", signedBatches.flatMap((batch) => batch.items).every((item) => item.rewrite !== "removePair"));
+signedIndex.entries["tc:sg1"] = { kind: "result", toolCallId: "sg1", toolName: "read", ts: 51, files: [], refText: "signed result ref", rewrite: "removePair", prunedChars: BIG.length };
+signedIndex.entries["tc:sg1:args"] = { kind: "args", toolCallId: "sg1", toolName: "read", ts: 51, files: [], refText: "signed args ref", rewrite: "removePair", stubArgs: { path: "stubbed" }, prunedChars: 10 };
+const signedRewrite = applyIndex(signedMessages, signedIndex).messages;
+const signedCall = (signedRewrite[0].content as Array<{ id?: string; arguments?: { path?: string } }>).find((block) => block.id === "sg1");
+check("legacy signed call rewrite remains verbatim", signedCall?.arguments?.path === "src/signed.ts");
+check("legacy signed tool result remains paired", signedRewrite.some((message) => message.toolCallId === "sg1"));
+rmSync(signedRoot, { recursive: true, force: true });
+
+console.log("11. recovery");
 const blocks = store.readArtifactBlocks(t3Entry.files[0].path);
 check("text artifact recovers as text block", blocks.length === 1 && blocks[0].type === "text" && blocks[0].text === BIG);
 const imgBlocks = store.readArtifactBlocks(imgEntry.files[0].path);
 check("image artifact recovers as image block", imgBlocks.length === 1 && imgBlocks[0].type === "image" && imgBlocks[0].mimeType === "image/png");
 check("resolveArtifactPath rejects outside paths", store.resolveArtifactPath("/etc/passwd") === null);
+check("indexed artifact path resolves for recovery", recoveryFiles(index, store, t3Entry.files[0].path)[0]?.path === t3Entry.files[0].path);
+const orderedBlocks = [
+	{ type: "text", text: "before" },
+	{ type: "image", data: Buffer.from("ordered-image").toString("base64"), mimeType: "image/png" },
+	{ type: "text", text: "after" },
+];
+const orderedFiles = store.writeArtifact("ordered-blocks", orderedBlocks);
+check("unindexed artifact path is rejected", recoveryFiles(index, store, orderedFiles[0].path).length === 0);
+check("mixed artifact block order round-trips", JSON.stringify(orderedFiles.flatMap((file) => store.readArtifactBlocks(file))) === JSON.stringify(orderedBlocks));
+const legacyPath = join(root, "legacy.akron.json");
+const legacyData = Buffer.from(JSON.stringify({ version: 1, blocks: orderedBlocks }));
+writeFileSync(legacyPath, legacyData);
+const legacyFile = { path: legacyPath, bytes: legacyData.length, sha256: createHash("sha256").update(legacyData).digest("hex") };
+check("legacy artifact bundles remain readable", JSON.stringify(store.readArtifactBlocks(legacyFile)) === JSON.stringify(orderedBlocks));
 
-console.log("10. integrity validation");
+console.log("11. integrity validation");
+const sharedIndex = store.loadIndex("shared-validation");
+const sharedArtifact = { ...t3Entry.files[0] };
+sharedIndex.entries.bad = { kind: "result", toolCallId: "bad", ts: 1, files: [{ ...sharedArtifact, sha256: "0".repeat(64) }], refText: "bad", prunedChars: 1 };
+sharedIndex.entries.good = { kind: "result", toolCallId: "good", ts: 1, files: [sharedArtifact], refText: "good", prunedChars: 1 };
+const sharedValidation = store.validateEntries(sharedIndex);
+check("shared artifact descriptors validate independently", sharedValidation.dropped === 1 && !sharedIndex.entries.bad && !!sharedIndex.entries.good);
 const corrupted = t3Entry.files[0].path;
-writeFileSync(corrupted, "tampered");
+writeFileSync(corrupted, Buffer.alloc(t3Entry.files[0].bytes, 121));
 const { dropped } = store.validateEntries(index);
-check("tampered artifact drops its entry", dropped === 1 && index.entries["tc:t3"] === undefined);
+check("same-size tampered artifact drops its entry", dropped === 1 && index.entries["tc:t3"] === undefined);
 const afterDrop = applyIndex(messages, index);
 const t3ResultRestored = afterDrop.messages.find((m) => m.role === "toolResult" && m.toolCallId === "t3");
 check("dropped entry falls back to original in context", t3ResultRestored === messages[6]);
 
-console.log("11. cache profiling stats");
+console.log("12. cache profiling stats");
 const cacheRecord = buildCacheProfileRecord(
 	{
 		role: "assistant",

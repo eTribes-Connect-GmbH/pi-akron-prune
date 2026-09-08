@@ -27,27 +27,27 @@ which protects unprocessed tool output and user images.
 | Pressure | remaining context capacity drops below 12%; selects enough eligible content to target 20% free context |
 | Emergency | ≥ 1.4M pending chars, still preserving the configured working-set floor |
 | Manual | `/akron now` |
-| Pre-compaction | A threshold compaction is cancelled when pruning can free ≥ 20% of the context — pruning instead of lossy compaction |
+| Pre-compaction | A threshold-time prune defers compaction for one provider request; pruning replaces compaction when it frees ≥ 20% |
 
-Routine thresholds are characters; pressure thresholds use the active model context window. Every threshold is configurable
+The one-request deferral lets pi measure the rewritten context instead of immediately reusing stale pre-prune usage. If the measured context still exceeds pi's threshold, normal compaction proceeds on the next check. Routine thresholds are characters; pressure thresholds use the active model context window. Every threshold is configurable
 (`~/.pi/agent/akron-prune/settings.json`).
 
 ### Pruning
 
 For each pending item, **write first, rewrite second**:
 
-- **Tool results** → the full text/images are written to an artifact file, re-read and
-  verified by sha256, and useful historical outputs are replaced in context with
+- **Tool results** → text and image blocks are written to directly readable artifact
+  files in their original order, re-read and verified by sha256, and useful historical outputs are replaced in context with
   `[akron-pruned: bash result (~5k chars) — original saved to <path>. Recover with the
   akron_recover tool (ref=<id>) or read the file.]`
 - **Consumed redundant evidence** → earlier repeated reads, superseded `write`/`edit`
   activity, and processed browser screenshots remove both the tool call and matching
   tool result from outgoing context. Surrounding assistant reasoning stays visible;
-  exact read/screenshot outputs and removed mutation arguments are still persisted as
-  artifacts even when no individual reference is left in context.
+  exact call arguments and results are still persisted as artifacts even when no
+  individual reference is left in context.
 - **File mutations** (`write`/`edit`) that are not removed → the tool-call arguments
-  (which carry the bulk content) are stubbed down to `{path, …}`; the file on disk is
-  the artifact. The workspace already contains the result.
+  (which carry the bulk content) are saved as artifacts and stubbed down to `{path, …}`.
+  The workspace already contains the result.
 - **Huge bash commands** (> 800 chars) → the full command is artifacted, the in-context
   copy keeps a 160-char prefix plus the artifact path.
 - **Uploaded user images** → persisted as artifacts, replaced with a text reference; the
@@ -79,8 +79,11 @@ index, so they replay deterministically on every request.
 
 The `akron_recover` tool restores any pruned output on demand — text, images, or
 artifacted mutation arguments — from the ref shown in the placeholder, a known tool
-call id, or an artifact path (paths outside the session's artifact store are rejected).
-Text artifacts can also be read with the normal `read` tool.
+call id, or an indexed artifact path. Append `:pair` to a removed tool-call id to
+recover the archived call followed by its result; ordinary recovery returns only the
+original result or arguments. Requiring index metadata keeps recovery hash-verified;
+paths outside the session's artifact store or no longer present in the index are
+rejected. Text artifacts can also be read directly with the normal `read` tool.
 
 ## Commands
 

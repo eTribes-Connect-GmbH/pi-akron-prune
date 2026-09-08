@@ -16,6 +16,9 @@ export interface ArtifactFile {
   /** sha256 of the file content at write time. */
   sha256: string;
   bytes: number;
+  /** Filesystem timestamps used to skip re-hashing unchanged artifacts at startup. */
+  mtimeMs?: number;
+  ctimeMs?: number;
 }
 
 /**
@@ -30,6 +33,8 @@ export interface PruneEntry {
   toolCallId?: string;
   ts: number;
   files: ArtifactFile[];
+  /** Files persisted for hidden pair removal; recoverable but not visible in context. */
+  hiddenFiles?: ArtifactFile[];
   /** Deterministic replacement text used when the entry remains visible in context. */
   refText: string;
   /** Whether rewrite should replace in place or remove the consumed call/result pair. */
@@ -56,6 +61,8 @@ export interface PruneIndex {
   createdTs: number;
   entries: Record<string, PruneEntry>;
   checkpoints: Checkpoint[];
+  /** Latest prune generation observed in a completed provider response. */
+  measuredPruneTs?: number;
 }
 
 export type ItemKind = "result" | "args" | "userImage";
@@ -75,6 +82,12 @@ export interface BatchItem {
   chars: number;
   isError?: boolean;
   blocks?: unknown[];
+  /** Exact matching tool-call block, archived before removing a pair. */
+  pairCall?: unknown;
+  /** False when rewriting/removing calls from the source assistant message would invalidate provider signatures. */
+  pairRemovalSafe?: boolean;
+  /** Exact matching tool-result blocks, archived when only the call arguments were otherwise eligible. */
+  pairResultBlocks?: unknown[];
   /** Removal is only used for consumed redundant evidence; assistant reasoning is kept. */
   rewrite?: RewriteMode;
   pruneReason?: string;

@@ -45,13 +45,43 @@ import { applyIndex } from "./rewrite.js";
 import { runPrune } from "./prune.js";
 import { ArtifactStore } from "./store.js";
 import { appendCacheProfile, buildCacheProfileRecord, formatStatusLine, readCacheProfilesForSession, type CacheProfileRecord } from "./stats.js";
-import type { Batch, PruneIndex, PruneStats } from "./types.js";
+import type { ArtifactFile, Batch, PruneIndex, PruneStats } from "./types.js";
 
 interface SessionState {
 	sessionId: string;
 	store: ArtifactStore;
 	index: PruneIndex;
 	cacheRecords: CacheProfileRecord[];
+	inFlightPruneTs?: number;
+}
+
+function latestPruneTs(index: PruneIndex): number {
+	return Object.values(index.entries).reduce((latest, entry) => Math.max(latest, entry.ts), 0);
+}
+
+export function hasUnmeasuredPrune(index: PruneIndex): boolean {
+	return latestPruneTs(index) > (index.measuredPruneTs ?? 0);
+}
+
+export function recoveryFiles(index: PruneIndex, store: ArtifactStore, ref: string): ArtifactFile[] {
+	const pair = ref.endsWith(":pair");
+	const key = pair ? ref.slice(0, -5) : ref;
+	const entry = index.entries[`tc:${key}`] ?? index.entries[`tc:${key}:args`] ?? index.entries[key];
+	if (entry && !pair) return entry.files;
+	if (pair) {
+		const candidates = [index.entries[`tc:${key}`], index.entries[`tc:${key}:args`], index.entries[key]];
+		const pairEntry = candidates.find((candidate) => candidate?.rewrite === "removePair");
+		if (!pairEntry) return [];
+		return pairEntry.kind === "result"
+			? [...(pairEntry.hiddenFiles ?? []), ...pairEntry.files]
+			: [...pairEntry.files, ...(pairEntry.hiddenFiles ?? [])];
+	}
+	const resolved = store.resolveArtifactPath(ref);
+	if (!resolved) return [];
+	const indexed = Object.values(index.entries)
+		.flatMap((candidate) => [...candidate.files, ...(candidate.hiddenFiles ?? [])])
+		.find((file) => file.path === resolved);
+	return indexed ? [indexed] : [];
 }
 
 export default function (pi: ExtensionAPI) {
@@ -67,8 +97,8 @@ export default function (pi: ExtensionAPI) {
 			if (state && state.sessionId === sid) return state;
 			const store = ArtifactStore.open(artifactsRoot(), sid);
 			const index = store.loadIndex(sid);
-			const { dropped } = store.validateEntries(index);
-			if (dropped > 0) store.saveIndex(index);
+			const { dropped, updated } = store.validateEntries(index);
+			if (dropped > 0 || updated > 0) store.saveIndex(index);
 			state = { sessionId: sid, store, index, cacheRecords: readCacheProfilesForSession(sid, 80) };
 			return state;
 		} catch {
@@ -124,7 +154,26 @@ export default function (pi: ExtensionAPI) {
 
 	function withRedundant(eligible: Batch[], pending: ReturnType<typeof pendingFrom>): ReturnType<typeof pendingFrom> {
 		if (pending.batches.length === 0) return pending;
-		return pendingFrom(eligible, cfg.newestBatches, workingSetOpts({ includeRedundant: true, targetChars: pending.chars }));
+		const selected = new Map(pending.batches.map((batch) => [batch.anchorMsgIndex, { ...batch, items: [...batch.items] }]));
+		const seen = new Set(pending.batches.flatMap((batch) => batch.items.map((item) => item.key)));
+
+		for (const batch of eligible) {
+			const extra = batch.items.filter((item) => item.rewrite === "removePair" && !seen.has(item.key));
+			if (extra.length === 0) continue;
+			for (const item of extra) seen.add(item.key);
+			const current = selected.get(batch.anchorMsgIndex) ?? { ...batch, items: [] };
+			current.items.push(...extra);
+			current.chars = current.items.reduce((total, item) => total + item.chars, 0);
+			current.lastMsgIndex = current.items.reduce((last, item) => Math.max(last, item.msgIndex), current.anchorMsgIndex);
+			selected.set(batch.anchorMsgIndex, current);
+		}
+
+		const batches = [...selected.values()].sort((a, b) => a.anchorMsgIndex - b.anchorMsgIndex);
+		return {
+			batches,
+			chars: batches.reduce((total, batch) => total + batch.chars, 0),
+			items: batches.reduce((total, batch) => total + batch.items.length, 0),
+		};
 	}
 
 	/** Context-pressure, standard, and emergency trigger evaluation. */
@@ -184,8 +233,13 @@ export default function (pi: ExtensionAPI) {
 		if (!choice || choice.batches.length === 0) return null;
 
 		return withLock(async () => {
-			// re-check inside the lock: another event may have pruned already
-			const stillPending = choice.batches.filter((b) => b.items.some((item) => !st.index.entries[item.key]));
+			// re-check inside the lock: another event may have pruned some selected items already
+			const stillPending = choice.batches
+				.map((b) => ({
+					...b,
+					items: b.items.filter((item) => !st.index.entries[item.key]),
+				}))
+				.filter((b) => b.items.length > 0);
 			if (stillPending.length === 0) return null;
 			return runPrune({
 				store: st.store,
@@ -306,6 +360,8 @@ export default function (pi: ExtensionAPI) {
 			updateStatus(ctx, messages);
 
 			if (applied.changed) {
+				const pruneTs = latestPruneTs(st.index);
+				if (pruneTs > (st.index.measuredPruneTs ?? 0)) st.inFlightPruneTs = pruneTs;
 				// SAFETY: applyIndex only replaces content in place on original
 				// messages or inserts structurally valid user messages; every
 				// element in applied.messages is a valid AgentMessage, but the
@@ -324,6 +380,11 @@ export default function (pi: ExtensionAPI) {
 		if (!st) return;
 		const record = buildCacheProfileRecord(event.message, st.index, st.sessionId);
 		if (!record) return;
+		if (st.inFlightPruneTs) {
+			st.index.measuredPruneTs = Math.max(st.index.measuredPruneTs ?? 0, st.inFlightPruneTs);
+			st.inFlightPruneTs = undefined;
+			st.store.saveIndex(st.index);
+		}
 		appendCacheProfile(record);
 		st.cacheRecords.push(record);
 		if (st.cacheRecords.length > 80) st.cacheRecords.splice(0, st.cacheRecords.length - 80);
@@ -338,23 +399,21 @@ export default function (pi: ExtensionAPI) {
 		if (event.reason !== "threshold") return; // never interfere with overflow recovery
 
 		try {
+			if (hasUnmeasuredPrune(st.index)) return { cancel: true };
 			const messages = messagesFromSession(ctx);
-			const choice = choosePrune(messages, ctx.getContextUsage());
-			if (!choice) return;
-
 			const tokensBefore = event.preparation.tokensBefore;
-
 			const stats = await maybePrune(ctx, messages, true);
 			if (!stats || stats.items === 0) return;
 
 			const freedTokens = Math.ceil((stats.charsPruned - stats.charsAdded) / 3.5);
-			if (tokensBefore > 0 && freedTokens >= Math.ceil(tokensBefore * cfg.compactionFreeFraction)) {
-				notify(
-					ctx,
-					`akron-prune: pruned ${stats.items} items (~${fmtK(stats.charsPruned)} chars) — cancelling compaction`,
-				);
-				return { cancel: true };
-			}
+			const replacesCompaction = tokensBefore > 0 && freedTokens >= Math.ceil(tokensBefore * cfg.compactionFreeFraction);
+			notify(
+				ctx,
+				replacesCompaction
+					? `akron-prune: pruned ${stats.items} items (~${fmtK(stats.charsPruned)} chars) — cancelling compaction`
+					: `akron-prune: pruned ${stats.items} items (~${fmtK(stats.charsPruned)} chars) — deferring compaction until context is remeasured`,
+			);
+			return { cancel: true };
 		} catch (err) {
 			notify(ctx, `akron-prune: compaction preemption failed — ${(err as Error).message}`, "error");
 		}
@@ -367,9 +426,10 @@ export default function (pi: ExtensionAPI) {
 		label: "Recover pruned output",
 		description:
 			"Recover the original content of a pruned tool result, command, mutation args, or uploaded image. " +
-			"Pass the ref from a pruned placeholder (toolCallId or user key), or the artifact file path. " +
-			"Returns the original text and/or image content.",
-		promptSnippet: "Recover pruned tool output or images by ref or artifact path.",
+			"Pass the ref from a pruned placeholder (toolCallId or user key), or an indexed artifact file path. " +
+			"Append ':pair' to a removed tool-call id to recover both the call and result. " +
+			"Returns the original text and/or image content after hash verification.",
+		promptSnippet: "Recover pruned output by ref or indexed path; use <toolCallId>:pair for a removed interaction.",
 		parameters: Type.Object({
 			ref: Type.String({ description: "Ref or artifact path shown in the pruned placeholder" }),
 		}),
@@ -380,15 +440,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const ref = String(params?.ref ?? "").trim();
 
-			let files: string[] = [];
-			const entry = st.index.entries[`tc:${ref}`] ?? st.index.entries[`tc:${ref}:args`] ?? st.index.entries[ref];
-			if (entry) {
-				files = entry.files.map((f) => f.path);
-			} else {
-				const resolved = st.store.resolveArtifactPath(ref);
-				if (resolved) files = [resolved];
-			}
-
+			const files = recoveryFiles(st.index, st.store, ref);
 			if (files.length === 0) {
 				return {
 					content: [{ type: "text" as const, text: `akron_recover: no artifact found for ref '${ref}'.` }],
@@ -406,7 +458,7 @@ export default function (pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
-				return { content, details: { files } };
+				return { content, details: { files: files.map((f) => f.path) } };
 			} catch (err) {
 				return {
 					content: [

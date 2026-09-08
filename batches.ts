@@ -10,6 +10,7 @@
  * window — the window slides forward on its own.
  */
 
+import { createHash } from "node:crypto";
 import type { Batch, BatchItem, PendingInfo, PruneIndex } from "./types.js";
 import type { AkronConfig } from "./config.js";
 
@@ -129,25 +130,30 @@ function mutationPath(item: BatchItem, cfg: AkronConfig): string | null {
 	return path || null;
 }
 
-function readSignature(item: BatchItem): string | null {
+function readCandidateKey(item: BatchItem): string | null {
 	if (item.kind !== "result" || item.toolName !== "read") return null;
-	return `${stableString(item.input)}:${item.chars}:${djb2(stableString(item.blocks ?? []))}`;
+	return `${stableString(item.input)}:${item.chars}`;
 }
 
 function markConsumedEvidence(messages: AnyMessage[], batches: Batch[], cfg: AkronConfig): void {
-	const readItems: Array<{ sig: string; item: BatchItem }> = [];
+	const readGroups = new Map<string, BatchItem[]>();
 	const mutationItems: Array<{ path: string; item: BatchItem }> = [];
 
 	for (const batch of batches) {
 		for (const item of batch.items) {
-			const sig = readSignature(item);
-			if (sig) readItems.push({ sig, item });
+			const readKey = readCandidateKey(item);
+			if (readKey) {
+				const group = readGroups.get(readKey) ?? [];
+				group.push(item);
+				readGroups.set(readKey, group);
+			}
 
 			const path = mutationPath(item, cfg);
 			if (path && hasLaterAssistant(messages, item.msgIndex)) mutationItems.push({ path, item });
 
 			if (
 				item.kind === "result" &&
+				item.pairRemovalSafe !== false &&
 				item.toolName === "agent_browser" &&
 				hasImageBlock(item.blocks) &&
 				hasLaterAssistant(messages, item.msgIndex)
@@ -158,15 +164,22 @@ function markConsumedEvidence(messages: AnyMessage[], batches: Batch[], cfg: Akr
 		}
 	}
 
-	const latestRead = new Map<string, BatchItem>();
-	for (const { sig, item } of readItems) {
-		const prev = latestRead.get(sig);
-		if (!prev || item.msgIndex > prev.msgIndex) latestRead.set(sig, item);
-	}
-	for (const { sig, item } of readItems) {
-		if (latestRead.get(sig) !== item && hasLaterAssistant(messages, item.msgIndex)) {
-			item.rewrite = "removePair";
-			item.pruneReason = "repeated-read";
+	for (const group of readGroups.values()) {
+		if (group.length < 2) continue;
+		const candidates = group.map((item) => ({
+			item,
+			output: createHash("sha256").update(stableString(item.blocks ?? [])).digest("hex"),
+		}));
+		const latestByOutput = new Map<string, BatchItem>();
+		for (const { item, output } of candidates) {
+			const latest = latestByOutput.get(output);
+			if (!latest || item.msgIndex > latest.msgIndex) latestByOutput.set(output, item);
+		}
+		for (const { item, output } of candidates) {
+			if (item.pairRemovalSafe !== false && latestByOutput.get(output) !== item && hasLaterAssistant(messages, item.msgIndex)) {
+				item.rewrite = "removePair";
+				item.pruneReason = "repeated-read";
+			}
 		}
 	}
 
@@ -208,17 +221,34 @@ function markConsumedEvidence(messages: AnyMessage[], batches: Batch[], cfg: Akr
 export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: AkronConfig): Batch[] {
 	const last = messages.length - 1;
 
-	// toolCallId → { name, input, assistant message index }
-	const calls = new Map<string, { name: string; input: unknown; msgIndex: number }>();
+	// toolCallId → matching call block metadata for lossless pair removal
+	const calls = new Map<string, { name: string; input: unknown; msgIndex: number; block: unknown; signedTurn: boolean }>();
 	for (let i = 0; i < messages.length; i++) {
 		const m = messages[i];
 		if (m?.role === "assistant" && Array.isArray(m.content)) {
-			for (const b of m.content as Array<{ type?: string; id?: string; name?: string; arguments?: unknown; input?: unknown }>) {
-				if (b?.type === "toolCall" && b.id) {
-					calls.set(b.id, {
-						name: b.name ?? "",
-						input: b.arguments ?? b.input ?? {},
+			const blocks = m.content as Array<{
+				type?: string;
+				id?: string;
+				name?: string;
+				arguments?: unknown;
+				input?: unknown;
+				thoughtSignature?: unknown;
+				textSignature?: unknown;
+				thinkingSignature?: unknown;
+			}>;
+			const signedTurn = blocks.some((block) =>
+				[block.thoughtSignature, block.textSignature, block.thinkingSignature].some(
+					(signature) => typeof signature === "string" && signature.length > 0,
+				),
+			);
+			for (const block of blocks) {
+				if (block?.type === "toolCall" && block.id) {
+					calls.set(block.id, {
+						name: block.name ?? "",
+						input: block.arguments ?? block.input ?? {},
 						msgIndex: i,
+						block,
+						signedTurn,
 					});
 				}
 			}
@@ -260,6 +290,7 @@ export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: A
 			if (!info) continue;
 			const batch = getToolBatch(info.msgIndex);
 			const input = info.input;
+			const pairResultBlocks = Array.isArray(m.content) ? (m.content as unknown[]) : undefined;
 
 			// 1) the tool result content itself
 			const resultKey = `tc:${m.toolCallId}`;
@@ -275,7 +306,10 @@ export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: A
 						msgIndex: i,
 						chars,
 						isError: !!m.isError,
-						blocks: Array.isArray(m.content) ? (m.content as unknown[]) : undefined,
+						blocks: pairResultBlocks,
+						pairCall: info.block,
+						pairRemovalSafe: !info.signedTurn,
+						pairResultBlocks,
 					};
 					batch.items.push(item);
 				}
@@ -283,7 +317,7 @@ export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: A
 
 			// 2) bulk tool-call arguments (file mutations, huge bash commands)
 			const argsKey = `tc:${m.toolCallId}:args`;
-			if (!index.entries[argsKey]) {
+			if (!index.entries[argsKey] && !info.signedTurn) {
 				const aChars = argsChars(input);
 				let prunable = false;
 				if (cfg.mutationTools.includes(info.name)) {
@@ -302,6 +336,8 @@ export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: A
 						argsMsgIndex: info.msgIndex,
 						chars: aChars,
 						isError: !!m.isError,
+						pairCall: info.block,
+						pairResultBlocks,
 					});
 				}
 			}

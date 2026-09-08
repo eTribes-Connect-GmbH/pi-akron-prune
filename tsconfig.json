@@ -8,15 +8,7 @@
 		"types": ["node"],
 		"skipLibCheck": true,
 		"noEmit": true,
-		"verbatimModuleSyntax": true,
-		"paths": {
-			"@earendil-works/pi-agent-core": [
-				"./node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core/dist/index.d.ts"
-			],
-			"typebox": [
-				"./node_modules/@earendil-works/pi-coding-agent/node_modules/typebox/build/index.d.mts"
-			]
-		}
+		"verbatimModuleSyntax": true
 	},
 	"include": ["./**/*.ts"],
 	"exclude": ["benchmark"]

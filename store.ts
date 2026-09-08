@@ -48,11 +48,8 @@ const MIME_BY_EXT: Record<string, string> = {
 };
 
 function extForMime(mimeType: string | undefined): string {
-	const m = (mimeType ?? "").toLowerCase();
-	for (const [ext, mime] of Object.entries(MIME_BY_EXT)) {
-		if (mime === m) return ext;
-	}
-	return "png";
+	const found = Object.entries(MIME_BY_EXT).find(([, mime]) => mime === mimeType?.toLowerCase());
+	return found?.[0] ?? "png";
 }
 
 /** Appends one profiling record — friend's "Effektivität auswerten" data source. */
@@ -90,6 +87,7 @@ export class ArtifactStore {
 						createdTs: typeof raw.createdTs === "number" ? raw.createdTs : Date.now(),
 						entries: raw.entries,
 						checkpoints: Array.isArray(raw.checkpoints) ? raw.checkpoints : [],
+						measuredPruneTs: typeof raw.measuredPruneTs === "number" ? raw.measuredPruneTs : undefined,
 					};
 				}
 			}
@@ -111,63 +109,98 @@ export class ArtifactStore {
 	 * callers must treat a throw as "do not prune this item".
 	 */
 	writeArtifact(base: string, blocks: Array<{ type?: string; text?: string; data?: string; mimeType?: string }>): ArtifactFile[] {
+		if (!blocks?.length) throw new Error(`no artifact content for ${base}`);
 		const files: ArtifactFile[] = [];
-		const textParts: string[] = [];
-		let imgIdx = 0;
-
-		for (const block of blocks ?? []) {
-			if (block?.type === "text" && typeof block.text === "string") {
-				textParts.push(block.text);
-			} else if (block?.type === "image" && typeof block.data === "string") {
-				const ext = extForMime(block.mimeType);
-				const path = join(this.sessionDir, `${base}-img${++imgIdx}.${ext}`);
-				const buf = Buffer.from(block.data, "base64");
-				this.writeVerified(path, buf);
-				files.push({ path, sha256: sha256(buf), bytes: buf.length });
+		for (let i = 0; i < blocks.length; i++) {
+			const block = blocks[i];
+			const suffix = blocks.length === 1 ? "" : `-block${i + 1}`;
+			let path: string;
+			let buf: Buffer;
+			if (block.type === "text" && typeof block.text === "string") {
+				path = join(this.sessionDir, `${base}${suffix}.txt`);
+				buf = Buffer.from(block.text, "utf8");
+			} else if (block.type === "image" && typeof block.data === "string") {
+				path = join(this.sessionDir, `${base}${suffix}.${extForMime(block.mimeType)}`);
+				buf = Buffer.from(block.data, "base64");
+			} else {
+				throw new Error(`unsupported artifact block ${i + 1} for ${base}`);
 			}
-		}
-
-		if (textParts.length > 0 && textParts.some((t) => t.length > 0)) {
-			const path = join(this.sessionDir, `${base}.txt`);
-			const text = textParts.length === 1 ? textParts[0] : textParts.join("\n\n--- [akron block boundary] ---\n\n");
-			const buf = Buffer.from(text, "utf8");
 			this.writeVerified(path, buf);
-			files.push({ path, sha256: sha256(buf), bytes: buf.length });
+			const { mtimeMs, ctimeMs } = statSync(path);
+			files.push({ path, sha256: sha256(buf), bytes: buf.length, mtimeMs, ctimeMs });
 		}
-
-		if (files.length === 0) throw new Error(`no artifact content for ${base}`);
 		return files;
 	}
 
 	private writeVerified(path: string, buf: Buffer): void {
-		writeFileSync(path, buf);
-		const back = readFileSync(path);
-		if (sha256(back) !== sha256(buf)) {
-			throw new Error(`artifact verification failed: ${path}`);
+		const tmp = `${path}.${process.pid}.tmp`;
+		try {
+			writeFileSync(tmp, buf);
+			const back = readFileSync(tmp);
+			if (sha256(back) !== sha256(buf)) throw new Error(`artifact verification failed: ${path}`);
+			renameSync(tmp, path);
+		} catch (err) {
+			rmSync(tmp, { force: true });
+			throw err;
 		}
 	}
 
 	/**
 	 * Drops index entries whose artifacts went missing or no longer match
-	 * their recorded size. Because the session file still holds the originals,
+	 * their recorded size/hash. Because the session file still holds the originals,
 	 * dropping an entry simply means the original stays in context — nothing
 	 * is lost. Returns how many entries were dropped.
 	 */
-	validateEntries(index: PruneIndex): { dropped: number } {
+	validateEntries(index: PruneIndex): { dropped: number; updated: number } {
 		let dropped = 0;
+		let updated = 0;
+		type ObservedArtifact = { exists: boolean; bytes?: number; sha256?: string; mtimeMs?: number; ctimeMs?: number };
+		const refsByPath = new Map<string, ArtifactFile[]>();
+		for (const entry of Object.values(index.entries)) {
+			for (const file of [...(entry.files ?? []), ...(entry.hiddenFiles ?? [])]) {
+				const refs = refsByPath.get(file.path) ?? [];
+				refs.push(file);
+				refsByPath.set(file.path, refs);
+			}
+		}
+
+		const checked = new Map<string, ObservedArtifact>();
+		for (const [path, refs] of refsByPath) {
+			try {
+				const stat = statSync(path);
+				const commonHash = refs.every((file) => file.sha256 === refs[0].sha256);
+				const unchanged = commonHash && refs.every(
+					(file) => file.bytes === stat.size && file.mtimeMs === stat.mtimeMs && file.ctimeMs === stat.ctimeMs,
+				);
+				checked.set(path, {
+					exists: true,
+					bytes: stat.size,
+					sha256: unchanged ? refs[0].sha256 : sha256(readFileSync(path)),
+					mtimeMs: stat.mtimeMs,
+					ctimeMs: stat.ctimeMs,
+				});
+			} catch {
+				checked.set(path, { exists: false });
+			}
+		}
+
 		for (const [key, entry] of Object.entries(index.entries)) {
-			for (const f of entry.files ?? []) {
-				try {
-					const st = statSync(f.path);
-					if (st.size !== f.bytes) throw new Error("size mismatch");
-				} catch {
+			for (const file of [...(entry.files ?? []), ...(entry.hiddenFiles ?? [])]) {
+				const observed = checked.get(file.path);
+				const valid = observed?.exists && file.bytes === observed.bytes && file.sha256 === observed.sha256;
+				if (!valid) {
 					delete index.entries[key];
 					dropped++;
 					break;
 				}
+				if (file.mtimeMs !== observed.mtimeMs || file.ctimeMs !== observed.ctimeMs) {
+					file.mtimeMs = observed.mtimeMs;
+					file.ctimeMs = observed.ctimeMs;
+					updated++;
+				}
 			}
 		}
-		return { dropped };
+		return { dropped, updated };
 	}
 
 	/** Resolves a user-supplied ref to an artifact path inside this session's store. */
@@ -179,16 +212,34 @@ export class ArtifactStore {
 		return abs;
 	}
 
-	/** Reads an artifact file back as content blocks (text or image). */
+	private readVerifiedArtifact(file: { path: string; sha256: string; bytes: number }): Buffer {
+		const buf = readFileSync(file.path);
+		if (buf.length !== file.bytes) throw new Error(`artifact size mismatch: ${file.path}`);
+		if (sha256(buf) !== file.sha256) throw new Error(`artifact hash mismatch: ${file.path}`);
+		return buf;
+	}
+
+	/** Reads an artifact file back as content blocks (text or image), verifying hash when metadata is supplied. */
 	readArtifactBlocks(
-		path: string,
+		file: string | { path: string; sha256: string; bytes: number },
 	): Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> {
+		const path = typeof file === "string" ? file : file.path;
+		const buf = typeof file === "string" ? readFileSync(path) : this.readVerifiedArtifact(file);
+		if (path.endsWith(".akron.json")) {
+			let parsed: { version?: number; blocks?: unknown };
+			try {
+				parsed = JSON.parse(buf.toString("utf8")) as { version?: number; blocks?: unknown };
+			} catch {
+				throw new Error(`invalid artifact bundle: ${path}`);
+			}
+			if (parsed.version !== 1 || !Array.isArray(parsed.blocks)) throw new Error(`invalid artifact bundle: ${path}`);
+			return parsed.blocks as Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>;
+		}
 		const ext = extname(path).slice(1).toLowerCase();
 		if (MIME_BY_EXT[ext]) {
-			const data = readFileSync(path).toString("base64");
-			return [{ type: "image", data, mimeType: MIME_BY_EXT[ext] }];
+			return [{ type: "image", data: buf.toString("base64"), mimeType: MIME_BY_EXT[ext] }];
 		}
-		return [{ type: "text", text: readFileSync(path, "utf8") }];
+		return [{ type: "text", text: buf.toString("utf8") }];
 	}
 
 	static sessionSizeBytes(sessionDir: string): number {

@@ -16,10 +16,26 @@ function anchorKeyOf(msg: AnyMessage): string {
 	return "";
 }
 
-function removedToolCallIds(index: PruneIndex): Set<string> {
+function signedToolCallIds(messages: AnyMessage[]): Set<string> {
+	const ids = new Set<string>();
+	for (const message of messages) {
+		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+		const content = message.content as AnyBlock[];
+		const calls = content.filter((block) => block.type === "toolCall");
+		const signed = content.some((block) =>
+			[block.thoughtSignature, block.textSignature, block.thinkingSignature].some(
+				(signature) => typeof signature === "string" && signature.length > 0,
+			),
+		);
+		if (signed) for (const call of calls) ids.add(String(call.id ?? ""));
+	}
+	return ids;
+}
+
+function removedToolCallIds(index: PruneIndex, signedIds: Set<string>): Set<string> {
 	const ids = new Set<string>();
 	for (const entry of Object.values(index.entries)) {
-		if (entry.rewrite === "removePair" && entry.toolCallId) ids.add(entry.toolCallId);
+		if (entry.rewrite === "removePair" && entry.toolCallId && !signedIds.has(entry.toolCallId)) ids.add(entry.toolCallId);
 	}
 	return ids;
 }
@@ -28,6 +44,7 @@ function rewriteAssistantMessage(
 	msg: AnyMessage,
 	index: PruneIndex,
 	removeIds: Set<string>,
+	signedIds: Set<string>,
 ): { message?: AnyMessage; changed: boolean } {
 	let changed = false;
 	const content: AnyBlock[] = [];
@@ -40,7 +57,7 @@ function rewriteAssistantMessage(
 				continue;
 			}
 			const entry = index.entries[`tc:${id}:args`];
-			if (entry?.stubArgs) {
+			if (entry?.stubArgs && !signedIds.has(id)) {
 				changed = true;
 				const { thoughtSignature: _thoughtSignature, ...stub } = block;
 				content.push({ ...stub, arguments: entry.stubArgs, input: entry.stubArgs });
@@ -76,8 +93,8 @@ function rewriteUserImageMessage(msg: AnyMessage, index: PruneIndex): { message?
 	return { message: { ...msg, content }, changed: true };
 }
 
-function rewriteMessage(msg: AnyMessage, index: PruneIndex, removeIds: Set<string>): { message?: AnyMessage; changed: boolean } {
-	if (msg.role === "assistant" && Array.isArray(msg.content)) return rewriteAssistantMessage(msg, index, removeIds);
+function rewriteMessage(msg: AnyMessage, index: PruneIndex, removeIds: Set<string>, signedIds: Set<string>): { message?: AnyMessage; changed: boolean } {
+	if (msg.role === "assistant" && Array.isArray(msg.content)) return rewriteAssistantMessage(msg, index, removeIds, signedIds);
 	if (msg.role === "toolResult" && msg.toolCallId) return rewriteToolResultMessage(msg, index, removeIds);
 	if (msg.role === "user" && Array.isArray(msg.content)) return rewriteUserImageMessage(msg, index);
 	return { message: msg, changed: false };
@@ -89,7 +106,8 @@ export function applyIndex(
 ): { messages: AnyMessage[]; changed: boolean } {
 	let changed = false;
 	const out: AnyMessage[] = [];
-	const removeIds = removedToolCallIds(index);
+	const signedIds = signedToolCallIds(messages);
+	const removeIds = removedToolCallIds(index, signedIds);
 
 	// anchor key → checkpoint texts to insert before that message
 	const insertBefore = new Map<string, string[]>();
@@ -113,7 +131,7 @@ export function applyIndex(
 			continue;
 		}
 
-		const rewritten = rewriteMessage(msg, index, removeIds);
+		const rewritten = rewriteMessage(msg, index, removeIds, signedIds);
 		if (rewritten.changed) changed = true;
 		if (rewritten.message) out.push(rewritten.message);
 	}
