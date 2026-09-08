@@ -35,6 +35,9 @@ function row(overrides: Partial<TurnRow>): TurnRow {
 		recoverCalls: 0,
 		assistantChars: 8,
 		retrievalCorrect: null,
+		testPassed: null,
+		testMs: null,
+		testOutputChars: 0,
 		failed: false,
 		...overrides,
 	};
@@ -60,13 +63,13 @@ check("percentile median even count", percentile([100, 200, 300, 400], 0.5) === 
 check("percentile p90 interpolates", percentile([100, 200, 300, 400], 0.9) === 370);
 check("percentile unsorted input", percentile([400, 100, 300, 200], 0.5) === 250);
 
-// aggregation: sums, cache-hit ratio, retrieval, prune/compaction events
+// aggregation: sums, cache-hit ratio, test results, prune/compaction events
 const rows: TurnRow[] = [
-	row({ phase: "fill", wallMs: 1000, contextTokens: 10_000, contextPercent: 10, recoverCalls: 1 }),
-	row({ phase: "fill", wallMs: 2000, contextTokens: 30_000, contextPercent: 30, recoverCalls: 2, usage: { input: 2000, output: 20, cacheRead: 18_000, cacheWrite: 0, totalTokens: 20_020, cost: 0.02 } }),
-	row({ phase: "tail", wallMs: 500, contextTokens: 20_000, contextPercent: 20 }),
-	row({ phase: "retrieve", wallMs: 400, retrievalCorrect: true }),
-	row({ phase: "retrieve", wallMs: 300, retrievalCorrect: null, failed: true }),
+	row({ phase: "task", wallMs: 1000, contextTokens: 10_000, contextPercent: 10, recoverCalls: 1, testPassed: true, testMs: 90, testOutputChars: 1000 }),
+	row({ phase: "task", wallMs: 2000, contextTokens: 30_000, contextPercent: 30, recoverCalls: 2, testPassed: false, testMs: 110, testOutputChars: 2000, usage: { input: 2000, output: 20, cacheRead: 18_000, cacheWrite: 0, totalTokens: 20_020, cost: 0.02 } }),
+	row({ phase: "final", wallMs: 500, contextTokens: 20_000, contextPercent: 20, testPassed: true, testMs: 100, testOutputChars: 3000 }),
+	row({ phase: "task", wallMs: 400, retrievalCorrect: true, testPassed: true, testMs: 120 }),
+	row({ phase: "task", wallMs: 300, retrievalCorrect: null, testPassed: null, failed: true }),
 ];
 const summary = aggregateArm(rows, [meta(), meta({ rep: 2, pruneEvents: 1, prunedChars: 10_000 })]);
 
@@ -85,10 +88,14 @@ check("aggregate max context tokens", summary.maxContextTokens === 30_000);
 check("aggregate max context percent", summary.maxContextPercent === 30);
 check("aggregate recovery calls", summary.recoverCalls === 3);
 check("aggregate median wall excludes failed", summary.medianWallMs === 750);
-check("aggregate fill median wall", summary.fillMedianWallMs === 1500);
+check("aggregate task median wall", summary.fillMedianWallMs === 1000);
 check("aggregate prune events", summary.pruneEvents === 3);
 check("aggregate pruned chars", summary.prunedChars === 60_000);
 check("aggregate compaction events", summary.compactionEvents === 0);
+check("aggregate tests scored", summary.testTotal === 4 && summary.testPassed === 3);
+check("aggregate test pass rate", summary.testPassRate === 0.75);
+check("aggregate test median ms", summary.testMedianMs === 105);
+check("aggregate test output chars", summary.testOutputChars === 6000);
 check("aggregate retrieval scored", summary.retrievalTotal === 1 && summary.retrievalCorrect === 1);
 
 // empty aggregation is safe
@@ -102,23 +109,27 @@ check("report includes arm", formatted.includes("akron"));
 check("report includes hit percent", formatted.includes("90.0%"));
 check("report includes max context", formatted.includes("30k/30.0%"));
 check("report includes recovery count", formatted.includes(" 3 "));
-check("report includes retrieval score", formatted.includes("1/1"));
+check("report includes test score", formatted.includes("3/4"));
 
-// workload determinism: same seed → identical markers and prompt script
+// workload determinism: same seed → identical prompt script
 const dirA = mkdtempSync(join(tmpdir(), "akron-bench-a-"));
 const dirB = mkdtempSync(join(tmpdir(), "akron-bench-b-"));
 try {
 	const a = createWorkload({ rounds: 3, fixtureBytes: 512, seed: 7, workdir: dirA });
 	const b = createWorkload({ rounds: 3, fixtureBytes: 512, seed: 7, workdir: dirB });
 	const c = createWorkload({ rounds: 3, fixtureBytes: 512, seed: 8, workdir: dirB });
-	check("same seed same markers", JSON.stringify(a.markers) === JSON.stringify(b.markers));
-	// Prompt texts embed absolute fixture paths, so compare with the workdir stripped.
+	// Prompt texts embed absolute project/briefing paths, so compare with the workdir stripped.
 	const promptShape = (w: Workload) =>
-		JSON.stringify(w.prompts.map((p) => ({ ...p, text: p.text.replace(w.fixturesDir, "") })));
+		JSON.stringify(
+			w.prompts.map((p) => ({
+				...p,
+				text: p.text.replaceAll(w.projectDir, "<project>").replaceAll(w.evidenceDir, "<evidence>"),
+			})),
+		);
 	check("same seed same prompts", promptShape(a) === promptShape(b));
-	check("different seed differs", JSON.stringify(a.markers) !== JSON.stringify(c.markers));
-	check("prompt script shape", a.prompts.length === 5 && a.prompts[3].phase === "tail" && a.prompts[4].phase === "retrieve");
-	check("retrieval targets oldest round", a.prompts[4].expectMarker === a.markers[0]);
+	check("different seed same prompt script", promptShape(a) === promptShape(c));
+	check("prompt script shape", a.prompts.length === 4 && a.prompts[0].phase === "task" && a.prompts[3].phase === "final");
+	check("test command shape", JSON.stringify(a.testCommand) === JSON.stringify(["npm", "test"]));
 } finally {
 	rmSync(dirA, { recursive: true, force: true });
 	rmSync(dirB, { recursive: true, force: true });

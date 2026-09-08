@@ -1,9 +1,13 @@
 /**
  * Aggregation + report for the pruning benchmark.
  *
- * Pure functions only (runner.ts owns side effects), so tests import
- * these directly. CLI: bun run report.ts <resultsDir> [--json]
+ * Runner.ts owns benchmark execution; this file owns pure aggregation plus
+ * a tiny CLI: bun run report.ts <resultsDir> [--json]
  */
+
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface TurnRow {
 	arm: string;
@@ -19,6 +23,9 @@ export interface TurnRow {
 	recoverCalls: number;
 	assistantChars: number;
 	retrievalCorrect: boolean | null;
+	testPassed?: boolean | null;
+	testMs?: number | null;
+	testOutputChars?: number;
 	failed: boolean;
 }
 
@@ -53,6 +60,11 @@ export interface ArmSummary {
 	prunedChars: number;
 	compactionEvents: number;
 	extensionErrors: number;
+	testPassed: number;
+	testTotal: number;
+	testPassRate: number | null;
+	testMedianMs: number;
+	testOutputChars: number;
 	retrievalCorrect: number;
 	retrievalTotal: number;
 }
@@ -77,7 +89,7 @@ export function aggregateArm(rows: TurnRow[], metas: RunMeta[]): ArmSummary {
 	const wall = scored.map((row) => row.wallMs);
 	const fillWall: number[] = [];
 	for (const row of scored) {
-		if (row.phase === "fill") fillWall.push(row.wallMs);
+		if (row.phase === "task") fillWall.push(row.wallMs);
 	}
 
 	let totalInput = 0;
@@ -115,9 +127,20 @@ export function aggregateArm(rows: TurnRow[], metas: RunMeta[]): ArmSummary {
 		prunedChars: metas.reduce((sum, meta) => sum + meta.prunedChars, 0),
 		compactionEvents: metas.reduce((sum, meta) => sum + meta.compactionEvents, 0),
 		extensionErrors: metas.reduce((sum, meta) => sum + meta.extensionErrors, 0),
+		testPassed: rows.filter((row) => row.testPassed === true).length,
+		testTotal: rows.filter((row) => row.testPassed !== null && row.testPassed !== undefined).length,
+		testPassRate: testPassRate(rows),
+		testMedianMs: percentile(rows.map((row) => row.testMs).filter((ms): ms is number => typeof ms === "number"), 0.5) ?? 0,
+		testOutputChars: rows.reduce((sum, row) => sum + (row.testOutputChars ?? 0), 0),
 		retrievalCorrect: rows.filter((row) => row.retrievalCorrect === true).length,
 		retrievalTotal: rows.filter((row) => row.retrievalCorrect !== null).length,
 	};
+}
+
+function testPassRate(rows: TurnRow[]): number | null {
+	const total = rows.filter((row) => row.testPassed !== null && row.testPassed !== undefined).length;
+	if (total === 0) return null;
+	return rows.filter((row) => row.testPassed === true).length / total;
 }
 
 function maxNullable(values: Array<number | null>): number | null {
@@ -145,15 +168,15 @@ function fmtMaxContext(summary: ArmSummary): string {
 
 export function formatReport(summaries: ArmSummary[]): string {
 	const header =
-		"arm    prompts  fail  cost$    wall     p50/p90      fill-p50   hit     in/rd/wr (tok)        maxctx       recover  prune/comp  retrieve";
+		"arm    prompts  fail  tests   cost$    wall     p50/p90      task-p50   hit     in/rd/wr (tok)        maxctx       recover  prune/comp";
 	const lines = summaries.map((summary) => {
 		const hit = summary.cacheHitRatio === null ? "n/a" : `${(summary.cacheHitRatio * 100).toFixed(1)}%`;
-		const retrieve =
-			summary.retrievalTotal === 0 ? "n/a" : `${summary.retrievalCorrect}/${summary.retrievalTotal}`;
+		const tests = summary.testTotal === 0 ? "n/a" : `${summary.testPassed}/${summary.testTotal}`;
 		return [
 			summary.arm.padEnd(6),
 			String(summary.prompts).padEnd(8),
 			String(summary.failedPrompts).padEnd(5),
+			tests.padEnd(7),
 			summary.totalCost.toFixed(4).padEnd(8),
 			fmtMs(summary.totalWallMs).padEnd(8),
 			`${fmtMs(summary.medianWallMs)}/${fmtMs(summary.p90WallMs)}`.padEnd(12),
@@ -163,8 +186,50 @@ export function formatReport(summaries: ArmSummary[]): string {
 			fmtMaxContext(summary).padEnd(12),
 			String(summary.recoverCalls).padEnd(8),
 			`${summary.pruneEvents}/${summary.compactionEvents}`.padEnd(11),
-			retrieve,
 		].join(" ");
 	});
 	return [header, ...lines].join("\n");
 }
+
+export function loadReport(resultsDir: string): ArmSummary[] {
+	const rows = readJsonl<TurnRow>(join(resultsDir, "results.jsonl"));
+	const summary = readJson<{ runs?: RunMeta[] }>(join(resultsDir, "summary.json"));
+	const metas = summary.runs ?? [];
+	const arms = [...new Set([...rows.map((row) => row.arm), ...metas.map((meta) => meta.arm)])].sort();
+	return arms.map((arm) => aggregateArm(rows.filter((row) => row.arm === arm), metas.filter((meta) => meta.arm === arm)));
+}
+
+function readJson<T>(path: string): T {
+	try {
+		return JSON.parse(readFileSync(path, "utf8")) as T;
+	} catch (error) {
+		throw new Error(`failed to parse ${path}: ${(error as Error).message}`);
+	}
+}
+
+function readJsonl<T>(path: string): T[] {
+	const rows: T[] = [];
+	let lineNumber = 0;
+	for (const line of readFileSync(path, "utf8").split("\n")) {
+		lineNumber += 1;
+		if (!line.trim()) continue;
+		try {
+			rows.push(JSON.parse(line) as T);
+		} catch (error) {
+			throw new Error(`failed to parse ${path}:${lineNumber}: ${(error as Error).message}`);
+		}
+	}
+	return rows;
+}
+
+function main(argv: string[]): void {
+	const dir = argv.find((arg) => !arg.startsWith("--"));
+	if (!dir) {
+		console.error("usage: bun run report.ts <resultsDir> [--json]");
+		process.exit(1);
+	}
+	const summaries = loadReport(dir);
+	console.log(argv.includes("--json") ? JSON.stringify(summaries, null, 2) : formatReport(summaries));
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) main(process.argv.slice(2));

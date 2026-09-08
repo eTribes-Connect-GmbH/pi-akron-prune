@@ -1,0 +1,78 @@
+{
+  "defaultModel": "openai-codex/gpt-5.6-luna",
+  "arms": ["pure", "pcp", "akron"],
+  "guardrail": "Do not run paid model/API benchmark prompts without explicit approval of model, reps, task list, and budget.",
+  "candidates": [
+    {
+      "id": "local-synthetic-coding",
+      "name": "Local synthetic coding benchmark",
+      "source": "benchmark/workload.ts",
+      "status": "implemented",
+      "harness": "pi RPC runner plus generated npm test project",
+      "pros": [
+        "cheap deterministic smoke test",
+        "executable correctness after each coding turn",
+        "controlled context pressure via verbose briefings"
+      ],
+      "cons": [
+        "synthetic tasks do not measure public-benchmark generalization",
+        "small generated project may be easier than real repository work"
+      ],
+      "recommendedUse": "First non-free smoke test for pruner loading, cost, latency, context pressure, and coding-turn correctness."
+    },
+    {
+      "id": "swe-bench-pro-public",
+      "name": "SWE-bench Pro public",
+      "source": "https://github.com/scaleapi/SWE-bench_Pro-os",
+      "dataset": "https://huggingface.co/datasets/ScaleAI/SWE-bench_Pro",
+      "status": "recommended-primary-future",
+      "harness": "Docker, Modal, or local Docker patch evaluation",
+      "pros": [
+        "731 public repository-level tasks",
+        "harder than SWE-bench Verified",
+        "executable patch scoring"
+      ],
+      "cons": [
+        "requires a separate pi patch-generation adapter",
+        "tasks vary in duration and context pressure"
+      ],
+      "recommendedUse": "Primary future benchmark after a baseline screen selects tasks where pruning or compaction actually occurs."
+    },
+    {
+      "id": "swe-bench-verified",
+      "name": "SWE-bench Verified",
+      "source": "https://github.com/SWE-bench/SWE-bench",
+      "dataset": "https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified",
+      "status": "calibration-future",
+      "harness": "swebench eval verified",
+      "pros": [
+        "500 human-validated Python issue tasks",
+        "standard public harness and leaderboard",
+        "good adapter sanity check"
+      ],
+      "cons": [
+        "many tasks may finish before pruning matters",
+        "Python-only subset is less representative for this pruner comparison"
+      ],
+      "recommendedUse": "Calibration/control set, not the primary pruning-effect score unless task traces cross context-pressure thresholds."
+    },
+    {
+      "id": "terminal-bench-software-engineering",
+      "name": "Terminal-Bench software-engineering subset",
+      "source": "https://github.com/harbor-framework/terminal-bench-1",
+      "website": "https://www.tbench.ai/",
+      "status": "secondary-future",
+      "harness": "tb run with Docker/uv",
+      "pros": [
+        "long tool-heavy terminal tasks",
+        "public task harness with executable tests",
+        "contains software-engineering-category tasks"
+      ],
+      "cons": [
+        "mixed benchmark, not purely coding",
+        "requires curation to avoid sysadmin/security/puzzle contamination"
+      ],
+      "recommendedUse": "Separate secondary stress track for terminal-heavy long-horizon behavior."
+    }
+  ]
+}

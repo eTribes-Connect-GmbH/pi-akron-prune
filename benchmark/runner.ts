@@ -9,14 +9,14 @@
  * Arms:
  *   pure   — no pruning (akron disabled, pi-context-prune absent)
  *   pcp    — pi-context-prune enabled via -e, akron disabled
- *   akron  — project-local akron-prune enabled, pcp absent
+ *   akron  — project-local pi-akron-prune enabled, pcp absent
  *
- * Usage: bun run runner.ts [--arms pure,pcp,akron] [--reps 3] [--rounds 24]
+ * Usage: bun run runner.ts [--arms pure,pcp,akron] [--reps 3] [--rounds 6]
  *                          [--fixture-bytes 46080] [--seed 42] [--model provider/modelId]
  *                          [--out results/<ts>]
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
 	appendFileSync,
 	copyFileSync,
@@ -48,6 +48,9 @@ interface TurnRow {
 	recoverCalls: number;
 	assistantChars: number;
 	retrievalCorrect: boolean | null;
+	testPassed: boolean | null;
+	testMs: number | null;
+	testOutputChars: number;
 	failed: boolean;
 }
 
@@ -274,12 +277,28 @@ function assistantText(message: Record<string, unknown>): string {
 		.join("");
 }
 
+function runTaskTests(projectDir: string, round: number): { passed: boolean; ms: number; outputChars: number } {
+	const startedAt = Date.now();
+	const result = spawnSync("npm", ["test"], {
+		cwd: projectDir,
+		env: { ...process.env, BENCH_MAX_ROUND: String(round) },
+		encoding: "utf8",
+		timeout: 120_000,
+	});
+	return {
+		passed: result.status === 0,
+		ms: Date.now() - startedAt,
+		outputChars: (result.stdout?.length ?? 0) + (result.stderr?.length ?? 0),
+	};
+}
+
 async function runPrompt(
 	client: RpcClient,
 	prompt: WorkloadPrompt,
 	arm: Arm,
 	rep: number,
 	promptTimeoutMs: number,
+	projectDir: string,
 ): Promise<TurnRow> {
 	const row: TurnRow = {
 		arm,
@@ -295,6 +314,9 @@ async function runPrompt(
 		recoverCalls: 0,
 		assistantChars: 0,
 		retrievalCorrect: null,
+		testPassed: null,
+		testMs: null,
+		testOutputChars: 0,
 		failed: false,
 	};
 
@@ -338,8 +360,11 @@ async function runPrompt(
 	// (e.g. request rejected after an aggressive context rewrite) — count it failed.
 	if (row.usage.totalTokens === 0) row.failed = true;
 
-	if (prompt.expectMarker && lastAssistant) {
-		row.retrievalCorrect = assistantText(lastAssistant).includes(prompt.expectMarker);
+	if (prompt.phase === "task" || prompt.phase === "final") {
+		const tests = runTaskTests(projectDir, prompt.round);
+		row.testPassed = tests.passed;
+		row.testMs = tests.ms;
+		row.testOutputChars = tests.outputChars;
 	}
 
 	try {
@@ -412,7 +437,7 @@ async function runOne(arm: Arm, rep: number, options: BenchOptions, outDir: stri
 	const rows: TurnRow[] = [];
 	let sessionFile: string | null = null;
 	for (const prompt of workload.prompts) {
-		const row = await runPrompt(client, prompt, arm, rep, options.promptTimeoutMs);
+		const row = await runPrompt(client, prompt, arm, rep, options.promptTimeoutMs, workload.projectDir);
 		rows.push(row);
 		if (row.failed) {
 			console.error(`[${arm}#${rep}] prompt ${prompt.phase}/${prompt.round} failed/timed out — stopping run`);
@@ -473,10 +498,10 @@ async function main(): Promise<void> {
 			.map((arm) => arm.trim() as Arm)
 			.filter((arm) => ARMS.includes(arm)),
 		reps: Number(args.reps ?? 3),
-		rounds: Number(args.rounds ?? 24),
+		rounds: Number(args.rounds ?? 6),
 		fixtureBytes: Number(args["fixture-bytes"] ?? 46_080),
 		seed: Number(args.seed ?? 42),
-		model: args.model && args.model !== "true" ? args.model : "zai/glm-5.3-flash",
+		model: args.model && args.model !== "true" ? args.model : "openai-codex/gpt-5.6-luna",
 		outDir: args.out && args.out !== "true" ? args.out : join(scriptDir, "results", String(Date.now())),
 		promptTimeoutMs: Number(args["prompt-timeout"] ?? 600_000) || 600_000,
 	};
