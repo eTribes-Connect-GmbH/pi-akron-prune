@@ -13,34 +13,41 @@ Based on the works of [tbo](https://github.com/tbo)
 ### Batching
 
 Completed tool activity and uploaded images form *batches* — one batch per assistant
-message that issued tool calls, or per user message that uploaded images. The newest
-16 eligible batches stay in context verbatim (and therefore cacheable); older batches
-become pruning candidates. A batch is only *complete* once a later message follows it,
-which protects the in-flight tail of the current turn.
+message that issued tool calls, or per user message that uploaded images. The protected
+working set keeps up to the newest 16 eligible batches, bounded by a 320k-character
+budget while always retaining at least 2 newest batches. Older content becomes pruning
+candidates. A batch is only *complete* once a later assistant message has consumed it,
+which protects unprocessed tool output and user images.
 
 ### Triggers
 
 | Trigger | Condition |
 | --- | --- |
 | Standard | ≥ 4 pending batches **and** ≥ 256k pending chars, **followed by** ≥ 64 items **or** ≥ 450k chars |
-| Emergency | ≥ 1.4M pending chars (prunes everything except the newest 2 batches) |
+| Pressure | remaining context capacity drops below 12%; selects enough eligible content to target 20% free context |
+| Emergency | ≥ 1.4M pending chars, still preserving the configured working-set floor |
 | Manual | `/akron now` |
 | Pre-compaction | A threshold compaction is cancelled when pruning can free ≥ 20% of the context — pruning instead of lossy compaction |
 
-All thresholds are characters, not tokens, and every one is configurable
+Routine thresholds are characters; pressure thresholds use the active model context window. Every threshold is configurable
 (`~/.pi/agent/akron-prune/settings.json`).
 
 ### Pruning
 
-For each pending item, **write first, replace second**:
+For each pending item, **write first, rewrite second**:
 
 - **Tool results** → the full text/images are written to an artifact file, re-read and
-  verified by sha256, and the result is replaced in context with
+  verified by sha256, and useful historical outputs are replaced in context with
   `[akron-pruned: bash result (~5k chars) — original saved to <path>. Recover with the
   akron_recover tool (ref=<id>) or read the file.]`
-- **File mutations** (`write`/`edit`) → the tool-call arguments (which carry the bulk
-  content) are stubbed down to `{path, …}`; the file on disk is the artifact. The
-  workspace already contains the result.
+- **Consumed redundant evidence** → earlier repeated reads, superseded `write`/`edit`
+  activity, and processed browser screenshots remove both the tool call and matching
+  tool result from outgoing context. Surrounding assistant reasoning stays visible;
+  exact read/screenshot outputs and removed mutation arguments are still persisted as
+  artifacts even when no individual reference is left in context.
+- **File mutations** (`write`/`edit`) that are not removed → the tool-call arguments
+  (which carry the bulk content) are stubbed down to `{path, …}`; the file on disk is
+  the artifact. The workspace already contains the result.
 - **Huge bash commands** (> 800 chars) → the full command is artifacted, the in-context
   copy keeps a 160-char prefix plus the artifact path.
 - **Uploaded user images** → persisted as artifacts, replaced with a text reference; the
@@ -61,7 +68,8 @@ index, so they replay deterministically on every request.
 
 ### What is never pruned
 
-- The newest batches (working set)
+- Unconsumed output (no later assistant continuation yet)
+- The configured newest working set
 - Results below `minResultChars` (~120 chars) — a reference wouldn't save anything
 - `read` results for markdown files (`.md`, `.mdx`) — working instructions stay in
   context verbatim
@@ -69,10 +77,10 @@ index, so they replay deterministically on every request.
 
 ## Recovery
 
-The `akron_recover` tool restores any pruned output on demand — text or images — from
-the ref shown in the placeholder or from an artifact path (paths outside the session's
-artifact store are rejected). Text artifacts can also be read with the normal `read`
-tool.
+The `akron_recover` tool restores any pruned output on demand — text, images, or
+artifacted mutation arguments — from the ref shown in the placeholder, a known tool
+call id, or an artifact path (paths outside the session's artifact store are rejected).
+Text artifacts can also be read with the normal `read` tool.
 
 ## Commands
 
@@ -114,6 +122,10 @@ ratio, and per-model cache usage.
   "enabled": true,
   "showStatus": true,
   "newestBatches": 16,
+  "workingSetChars": 320000,
+  "minWorkingSetBatches": 2,
+  "pressureTriggerRemainingRatio": 0.12,
+  "pressureTargetRemainingRatio": 0.2,
   "minPendingBatches": 4,
   "minPendingChars": 256000,
   "triggerItems": 64,

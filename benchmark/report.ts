@@ -46,6 +46,9 @@ export interface ArmSummary {
 	totalCacheWrite: number;
 	totalOutput: number;
 	cacheHitRatio: number | null;
+	maxContextTokens: number | null;
+	maxContextPercent: number | null;
+	recoverCalls: number;
 	pruneEvents: number;
 	prunedChars: number;
 	compactionEvents: number;
@@ -72,7 +75,10 @@ function isPromptSide(row: TurnRow): boolean {
 export function aggregateArm(rows: TurnRow[], metas: RunMeta[]): ArmSummary {
 	const scored = rows.filter(isPromptSide);
 	const wall = scored.map((row) => row.wallMs);
-	const fillWall = scored.filter((row) => row.phase === "fill").map((row) => row.wallMs);
+	const fillWall: number[] = [];
+	for (const row of scored) {
+		if (row.phase === "fill") fillWall.push(row.wallMs);
+	}
 
 	let totalInput = 0;
 	let totalCacheRead = 0;
@@ -102,6 +108,9 @@ export function aggregateArm(rows: TurnRow[], metas: RunMeta[]): ArmSummary {
 		totalCacheWrite,
 		totalOutput,
 		cacheHitRatio: promptSide > 0 ? totalCacheRead / promptSide : null,
+		maxContextTokens: maxNullable(rows.map((row) => row.contextTokens)),
+		maxContextPercent: maxNullable(rows.map((row) => row.contextPercent)),
+		recoverCalls: rows.reduce((sum, row) => sum + row.recoverCalls, 0),
 		pruneEvents: metas.reduce((sum, meta) => sum + meta.pruneEvents, 0),
 		prunedChars: metas.reduce((sum, meta) => sum + meta.prunedChars, 0),
 		compactionEvents: metas.reduce((sum, meta) => sum + meta.compactionEvents, 0),
@@ -109,6 +118,15 @@ export function aggregateArm(rows: TurnRow[], metas: RunMeta[]): ArmSummary {
 		retrievalCorrect: rows.filter((row) => row.retrievalCorrect === true).length,
 		retrievalTotal: rows.filter((row) => row.retrievalCorrect !== null).length,
 	};
+}
+
+function maxNullable(values: Array<number | null>): number | null {
+	let max: number | null = null;
+	for (const value of values) {
+		if (value === null) continue;
+		max = max === null ? value : Math.max(max, value);
+	}
+	return max;
 }
 
 function fmtMs(ms: number): string {
@@ -119,9 +137,15 @@ function fmtTokens(tokens: number): string {
 	return tokens >= 1_000_000 ? `${(tokens / 1_000_000).toFixed(2)}M` : `${Math.round(tokens / 1000)}k`;
 }
 
+function fmtMaxContext(summary: ArmSummary): string {
+	if (summary.maxContextTokens === null) return "n/a";
+	const percent = summary.maxContextPercent === null ? "?" : `${summary.maxContextPercent.toFixed(1)}%`;
+	return `${fmtTokens(summary.maxContextTokens)}/${percent}`;
+}
+
 export function formatReport(summaries: ArmSummary[]): string {
 	const header =
-		"arm    prompts  fail  cost$    wall     p50/p90      fill-p50   hit     in/rd/wr (tok)        prune/comp  retrieve";
+		"arm    prompts  fail  cost$    wall     p50/p90      fill-p50   hit     in/rd/wr (tok)        maxctx       recover  prune/comp  retrieve";
 	const lines = summaries.map((summary) => {
 		const hit = summary.cacheHitRatio === null ? "n/a" : `${(summary.cacheHitRatio * 100).toFixed(1)}%`;
 		const retrieve =
@@ -136,6 +160,8 @@ export function formatReport(summaries: ArmSummary[]): string {
 			fmtMs(summary.fillMedianWallMs).padEnd(10),
 			hit.padEnd(7),
 			`${fmtTokens(summary.totalInput)}/${fmtTokens(summary.totalCacheRead)}/${fmtTokens(summary.totalCacheWrite)}`.padEnd(21),
+			fmtMaxContext(summary).padEnd(12),
+			String(summary.recoverCalls).padEnd(8),
 			`${summary.pruneEvents}/${summary.compactionEvents}`.padEnd(11),
 			retrieve,
 		].join(" ");

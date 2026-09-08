@@ -68,6 +68,8 @@ async function pruneItem(
 				ts: now,
 				files,
 				refText,
+				rewrite: item.rewrite,
+				pruneReason: item.pruneReason,
 				isError: item.isError,
 				prunedChars: item.chars,
 			},
@@ -77,18 +79,25 @@ async function pruneItem(
 	if (item.kind === "args") {
 		const input = (item.input ?? {}) as Record<string, unknown>;
 
-		// file mutations: the workspace already contains the result
+		// file mutations: ordinary pruning keeps a stub; removed pairs still persist exact args as a hidden artifact
 		if (cfg.mutationTools.includes(item.toolName ?? "")) {
 			const { stub, note } = stubMutationArgs(item.toolName ?? "write", input);
+			const files = item.rewrite === "removePair"
+				? store.writeArtifact(`tc-${sanitizeId(item.toolCallId ?? item.key)}-args`, [
+					{ type: "text", text: JSON.stringify({ tool: item.toolName, arguments: input }, null, 2) },
+				])
+				: [];
 			return {
 				entry: {
 					kind: "args",
 					toolName: item.toolName,
 					toolCallId: item.toolCallId,
 					ts: now,
-					files: [],
-					refText: note,
-					stubArgs: stub,
+					files,
+					refText: files[0] ? `[akron-pruned: ${item.toolName} pair removed — arguments saved to ${files[0].path}]` : note,
+					rewrite: item.rewrite,
+					pruneReason: item.pruneReason,
+					stubArgs: item.rewrite === "removePair" ? undefined : stub,
 					prunedChars: item.chars,
 				},
 			};
@@ -109,6 +118,8 @@ async function pruneItem(
 				ts: now,
 				files,
 				refText: `[akron-pruned: bash command arguments stubbed — full command in ${files[0].path}]`,
+				rewrite: item.rewrite,
+				pruneReason: item.pruneReason,
 				stubArgs: stub,
 				prunedChars: item.chars,
 			},
@@ -164,7 +175,7 @@ export async function runPrune(opts: {
 				index.entries[item.key] = entry;
 				stats.items++;
 				stats.charsPruned += item.chars;
-				stats.charsAdded += entry.refText.length + (entry.stubArgs ? argsChars(entry.stubArgs) : 0);
+				stats.charsAdded += entry.rewrite === "removePair" ? 0 : entry.refText.length + (entry.stubArgs ? argsChars(entry.stubArgs) : 0);
 				batchPruned++;
 			} catch {
 				// verification failed or write error: keep the original in context

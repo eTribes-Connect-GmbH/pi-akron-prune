@@ -8,6 +8,7 @@
  */
 
 export type EntryKind = "result" | "args" | "userImage";
+export type RewriteMode = "replace" | "removePair";
 
 export interface ArtifactFile {
   /** Absolute path of the artifact on disk. */
@@ -29,8 +30,12 @@ export interface PruneEntry {
   toolCallId?: string;
   ts: number;
   files: ArtifactFile[];
-  /** Deterministic replacement text used in the outgoing context. */
+  /** Deterministic replacement text used when the entry remains visible in context. */
   refText: string;
+  /** Whether rewrite should replace in place or remove the consumed call/result pair. */
+  rewrite?: RewriteMode;
+  /** Why this entry was selected for pruning; useful in profile/debug output. */
+  pruneReason?: string;
   /** Replacement arguments for stubbed tool calls (args entries only). */
   stubArgs?: Record<string, unknown>;
   isError?: boolean;
@@ -70,6 +75,9 @@ export interface BatchItem {
   chars: number;
   isError?: boolean;
   blocks?: unknown[];
+  /** Removal is only used for consumed redundant evidence; assistant reasoning is kept. */
+  rewrite?: RewriteMode;
+  pruneReason?: string;
 }
 
 export interface Batch {

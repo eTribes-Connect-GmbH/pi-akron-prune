@@ -40,8 +40,8 @@ extension errors.
 
 Aggregate report per arm: total cost, total/p50/p90 wall time, fill-p50 latency,
 cache-hit ratio (`cacheRead / (cacheRead + input + cacheWrite)` over all rows — failed
-prompts still spend real tokens and are included), prune/compaction event counts, and
-retrieval score.
+prompts still spend real tokens and are included), maximum observed context size,
+`akron_recover` calls, prune/compaction event counts, and retrieval score.
 
 ## Usage
 

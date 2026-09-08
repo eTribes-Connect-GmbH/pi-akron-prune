@@ -167,14 +167,85 @@ const second = applyIndex(messages, index);
 check("rewrite is deterministic", JSON.stringify(second.messages) === JSON.stringify(rewritten));
 check("re-compute finds no new pending", computeBatches(messages, index, cfg).length === 0);
 
-console.log("6. recovery");
+console.log("6. pressure/budget selection");
+const fakeBatches = Array.from({ length: 5 }, (_, i) => ({
+	anchorMsgIndex: i,
+	anchorKey: `b${i + 1}`,
+	anchorIsUser: false,
+	items: [{ kind: "result" as const, key: `k${i + 1}`, msgIndex: i, chars: 100 }],
+	chars: 100,
+	lastMsgIndex: i,
+	complete: true,
+}));
+const budgetPending = pendingFrom(fakeBatches, 4, { keepChars: 250, minKeepBatches: 1 });
+check("working-set budget prunes within recent window", budgetPending.batches.map((b) => b.anchorKey).join(",") === "b1,b2,b3");
+const targetPending = pendingFrom(fakeBatches, 4, { keepChars: 250, minKeepBatches: 1, targetChars: 150 });
+check("pressure target selects enough eligible content", targetPending.batches.map((b) => b.anchorKey).join(",") === "b1,b2");
+
+console.log("7. redundant recent removal");
+const SCREENSHOT = Buffer.alloc(5000, 7).toString("base64");
+const redundantMessages: AnyMessage[] = [
+	{ role: "user", content: "repeat and mutate", timestamp: 20 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "r1", name: "read", arguments: { path: "src/a.ts" } }], timestamp: 21 },
+	{ role: "toolResult", toolCallId: "r1", toolName: "read", content: [{ type: "text", text: BIG }], timestamp: 22 },
+	{ role: "assistant", content: [{ type: "text", text: "processed first read" }], timestamp: 23 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "r2", name: "read", arguments: { path: "src/a.ts" } }], timestamp: 24 },
+	{ role: "toolResult", toolCallId: "r2", toolName: "read", content: [{ type: "text", text: BIG }], timestamp: 25 },
+	{ role: "assistant", content: [{ type: "text", text: "processed repeated read" }], timestamp: 26 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "w1", name: "write", arguments: { path: "src/a.ts", content: BIG } }], timestamp: 27 },
+	{ role: "toolResult", toolCallId: "w1", toolName: "write", content: [{ type: "text", text: BIG }], timestamp: 28 },
+	{ role: "assistant", content: [{ type: "text", text: "processed first mutation" }], timestamp: 29 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "w2", name: "edit", arguments: { path: "src/a.ts", edits: [{ oldText: "x", newText: BIG }] } }], timestamp: 30 },
+	{ role: "toolResult", toolCallId: "w2", toolName: "edit", content: [{ type: "text", text: "edited" }], timestamp: 31 },
+	{ role: "assistant", content: [{ type: "text", text: "processed second mutation" }], timestamp: 32 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "br1", name: "agent_browser", arguments: { args: ["screenshot"] } }], timestamp: 33 },
+	{ role: "toolResult", toolCallId: "br1", toolName: "agent_browser", content: [{ type: "image", data: SCREENSHOT, mimeType: "image/png" }], timestamp: 34 },
+	{ role: "assistant", content: [{ type: "text", text: "processed screenshot" }], timestamp: 35 },
+];
+const redundantRoot = mkdtempSync(join(tmpdir(), "akron-redundant-"));
+const redundantStore = ArtifactStore.open(redundantRoot, "redundant-session");
+const redundantIndex = redundantStore.loadIndex("redundant-session");
+const redundantBatches = computeBatches(redundantMessages, redundantIndex, cfg);
+const redundantPending = pendingFrom(redundantBatches, 99, { includeRedundant: true });
+check("redundant recent items selected", redundantPending.items === 4, `got ${redundantPending.items}`);
+await runPrune({ store: redundantStore, index: redundantIndex, cfg, batches: redundantPending.batches, cwd: process.cwd(), sessionId: "redundant-session", trigger: "redundant-test" });
+const w1ArgsEntry = redundantIndex.entries["tc:w1:args"];
+check("removed mutation args are artifacted", !!w1ArgsEntry?.files[0] && readFileSync(w1ArgsEntry.files[0].path, "utf8").includes(BIG));
+check("all selected w1 items remove the pair", redundantIndex.entries["tc:w1"]?.rewrite === "removePair" && w1ArgsEntry?.rewrite === "removePair");
+const redundantRewrite = applyIndex(redundantMessages, redundantIndex).messages;
+check("earlier repeated read pair removed", !redundantRewrite.some((m) => m.toolCallId === "r1") && !JSON.stringify(redundantRewrite).includes('"id":"r1"'));
+check("latest repeated read remains", redundantRewrite.some((m) => m.toolCallId === "r2") && JSON.stringify(redundantRewrite).includes('"id":"r2"'));
+check("superseded mutation pair removed", !redundantRewrite.some((m) => m.toolCallId === "w1") && !JSON.stringify(redundantRewrite).includes('"id":"w1"'));
+check("latest mutation remains", redundantRewrite.some((m) => m.toolCallId === "w2") && JSON.stringify(redundantRewrite).includes('"id":"w2"'));
+check("consumed browser screenshot pair removed", !redundantRewrite.some((m) => m.toolCallId === "br1") && !JSON.stringify(redundantRewrite).includes('"id":"br1"'));
+check("assistant reasoning remains", redundantRewrite.some((m) => JSON.stringify(m.content).includes("processed first read")));
+rmSync(redundantRoot, { recursive: true, force: true });
+
+console.log("8. failed mutations are not supersession evidence");
+const failedRoot = mkdtempSync(join(tmpdir(), "akron-failed-mutation-"));
+const failedStore = ArtifactStore.open(failedRoot, "failed-mutation-session");
+const failedIndex = failedStore.loadIndex("failed-mutation-session");
+const failedMutationMessages: AnyMessage[] = [
+	{ role: "user", content: "mutate with a failed retry", timestamp: 40 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "fw1", name: "write", arguments: { path: "src/b.ts", content: BIG } }], timestamp: 41 },
+	{ role: "toolResult", toolCallId: "fw1", toolName: "write", content: [{ type: "text", text: "updated" }], timestamp: 42 },
+	{ role: "assistant", content: [{ type: "text", text: "processed successful write" }], timestamp: 43 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "fw2", name: "edit", arguments: { path: "src/b.ts", edits: [{ oldText: "missing", newText: BIG }] } }], timestamp: 44 },
+	{ role: "toolResult", toolCallId: "fw2", toolName: "edit", content: [{ type: "text", text: "oldText not found" }], isError: true, timestamp: 45 },
+	{ role: "assistant", content: [{ type: "text", text: "processed failed edit" }], timestamp: 46 },
+];
+const failedPending = pendingFrom(computeBatches(failedMutationMessages, failedIndex, cfg), 99, { includeRedundant: true });
+check("failed later mutation does not supersede earlier mutation", failedPending.items === 0, `got ${failedPending.items}`);
+rmSync(failedRoot, { recursive: true, force: true });
+
+console.log("9. recovery");
 const blocks = store.readArtifactBlocks(t3Entry.files[0].path);
 check("text artifact recovers as text block", blocks.length === 1 && blocks[0].type === "text" && blocks[0].text === BIG);
 const imgBlocks = store.readArtifactBlocks(imgEntry.files[0].path);
 check("image artifact recovers as image block", imgBlocks.length === 1 && imgBlocks[0].type === "image" && imgBlocks[0].mimeType === "image/png");
 check("resolveArtifactPath rejects outside paths", store.resolveArtifactPath("/etc/passwd") === null);
 
-console.log("7. integrity validation");
+console.log("10. integrity validation");
 const corrupted = t3Entry.files[0].path;
 writeFileSync(corrupted, "tampered");
 const { dropped } = store.validateEntries(index);
@@ -183,7 +254,7 @@ const afterDrop = applyIndex(messages, index);
 const t3ResultRestored = afterDrop.messages.find((m) => m.role === "toolResult" && m.toolCallId === "t3");
 check("dropped entry falls back to original in context", t3ResultRestored === messages[6]);
 
-console.log("8. cache profiling stats");
+console.log("11. cache profiling stats");
 const cacheRecord = buildCacheProfileRecord(
 	{
 		role: "assistant",

@@ -1,53 +1,86 @@
-/**
- * akron-prune — context rewrite.
- *
- * Applies the durable prune index to the outgoing message array. This runs
- * on EVERY LLM call (the `context` event receives a fresh deep copy of the
- * session's messages), so everything it emits must be deterministic:
- * reference texts and checkpoint texts are generated once at prune time,
- * stored in the index, and replayed verbatim. Identical input → identical
- * output on every call is what keeps the rewritten prefix cacheable.
- *
- * The rewrite never deletes messages: tool results keep their toolCallId
- * and are replaced in place, toolCall blocks keep their id and only get
- * stubbed arguments, user images become text references. toolCall↔toolResult
- * pairing and thinking signatures stay valid for every provider.
- */
-
-import { userKey } from "./batches.js";
+import { userKey, type AnyMessage } from "./batches.js";
 import type { PruneIndex } from "./types.js";
 
-type AnyBlock = {
-	type?: string;
-	id?: string;
-	name?: string;
-	arguments?: unknown;
-	input?: unknown;
-	thoughtSignature?: unknown;
-	text?: string;
-	data?: string;
-	mimeType?: string;
-};
+type AnyBlock = Record<string, unknown>;
 
-type AnyMessage = {
-	role?: string;
-	content?: unknown;
-	timestamp?: number;
-	toolCallId?: string;
-};
-
-/** Key of the message a checkpoint is anchored to (first toolCall id / user key). */
-function anchorKeyOf(msg: AnyMessage): string | null {
-	if (msg?.role === "assistant" && Array.isArray(msg.content)) {
-		for (const b of msg.content as AnyBlock[]) {
+function anchorKeyOf(msg: AnyMessage): string {
+	if (!msg) return "";
+	if (msg.role === "assistant" && Array.isArray(msg.content)) {
+		for (const b of msg.content as Array<{ type?: string; id?: string }>) {
 			if (b?.type === "toolCall" && b.id) return b.id;
 		}
-		return null;
 	}
-	if (msg?.role === "user" && Array.isArray(msg.content)) {
-		if ((msg.content as AnyBlock[]).some((b) => b?.type === "image")) return userKey(msg);
+	if (msg.role === "user" && Array.isArray(msg.content) && (msg.content as Array<{ type?: string }>).some((b) => b?.type === "image")) {
+		return userKey(msg);
 	}
-	return null;
+	return "";
+}
+
+function removedToolCallIds(index: PruneIndex): Set<string> {
+	const ids = new Set<string>();
+	for (const entry of Object.values(index.entries)) {
+		if (entry.rewrite === "removePair" && entry.toolCallId) ids.add(entry.toolCallId);
+	}
+	return ids;
+}
+
+function rewriteAssistantMessage(
+	msg: AnyMessage,
+	index: PruneIndex,
+	removeIds: Set<string>,
+): { message?: AnyMessage; changed: boolean } {
+	let changed = false;
+	const content: AnyBlock[] = [];
+
+	for (const block of msg.content as AnyBlock[]) {
+		const id = block?.type === "toolCall" ? String(block.id ?? "") : "";
+		if (id) {
+			if (removeIds.has(id)) {
+				changed = true;
+				continue;
+			}
+			const entry = index.entries[`tc:${id}:args`];
+			if (entry?.stubArgs) {
+				changed = true;
+				const { thoughtSignature: _thoughtSignature, ...stub } = block;
+				content.push({ ...stub, arguments: entry.stubArgs, input: entry.stubArgs });
+				continue;
+			}
+		}
+		content.push(block);
+	}
+
+	if (!changed) return { message: msg, changed: false };
+	return content.length > 0 ? { message: { ...msg, content }, changed: true } : { changed: true };
+}
+
+function rewriteToolResultMessage(
+	msg: AnyMessage,
+	index: PruneIndex,
+	removeIds: Set<string>,
+): { message?: AnyMessage; changed: boolean } {
+	const toolCallId = String((msg as { toolCallId?: unknown }).toolCallId ?? "");
+	if (removeIds.has(toolCallId)) return { changed: true };
+
+	const entry = index.entries[`tc:${toolCallId}`];
+	if (!entry) return { message: msg, changed: false };
+	return { message: { ...msg, content: [{ type: "text", text: entry.refText }] }, changed: true };
+}
+
+function rewriteUserImageMessage(msg: AnyMessage, index: PruneIndex): { message?: AnyMessage; changed: boolean } {
+	const entry = index.entries[userKey(msg)];
+	if (!entry) return { message: msg, changed: false };
+	const content = (msg.content as AnyBlock[]).map((block) =>
+		block?.type === "image" ? { type: "text", text: entry.refText } : block,
+	);
+	return { message: { ...msg, content }, changed: true };
+}
+
+function rewriteMessage(msg: AnyMessage, index: PruneIndex, removeIds: Set<string>): { message?: AnyMessage; changed: boolean } {
+	if (msg.role === "assistant" && Array.isArray(msg.content)) return rewriteAssistantMessage(msg, index, removeIds);
+	if (msg.role === "toolResult" && msg.toolCallId) return rewriteToolResultMessage(msg, index, removeIds);
+	if (msg.role === "user" && Array.isArray(msg.content)) return rewriteUserImageMessage(msg, index);
+	return { message: msg, changed: false };
 }
 
 export function applyIndex(
@@ -56,6 +89,7 @@ export function applyIndex(
 ): { messages: AnyMessage[]; changed: boolean } {
 	let changed = false;
 	const out: AnyMessage[] = [];
+	const removeIds = removedToolCallIds(index);
 
 	// anchor key → checkpoint texts to insert before that message
 	const insertBefore = new Map<string, string[]>();
@@ -66,7 +100,6 @@ export function applyIndex(
 	}
 
 	for (const msg of messages) {
-		// checkpoints anchored to this message
 		const anchor = anchorKeyOf(msg);
 		if (anchor) {
 			for (const text of insertBefore.get(anchor) ?? []) {
@@ -80,59 +113,9 @@ export function applyIndex(
 			continue;
 		}
 
-		if (msg.role === "assistant" && Array.isArray(msg.content)) {
-			let modified = false;
-			const content = (msg.content as AnyBlock[]).map((block) => {
-				if (block?.type === "toolCall" && block.id) {
-					const entry = index.entries[`tc:${block.id}:args`];
-					if (entry?.stubArgs) {
-						modified = true;
-						const stub: AnyBlock = { ...block };
-						// a stubbed argument set no longer matches any thought
-						// signature attached to the original call
-						delete stub.thoughtSignature;
-						stub.arguments = entry.stubArgs;
-						stub.input = entry.stubArgs;
-						return stub;
-					}
-				}
-				return block;
-			});
-			if (modified) {
-				changed = true;
-				out.push({ ...msg, content });
-				continue;
-			}
-			out.push(msg);
-			continue;
-		}
-
-		if (msg.role === "toolResult" && msg.toolCallId) {
-			const entry = index.entries[`tc:${msg.toolCallId}`];
-			if (entry) {
-				changed = true;
-				out.push({ ...msg, content: [{ type: "text", text: entry.refText }] });
-				continue;
-			}
-			out.push(msg);
-			continue;
-		}
-
-		if (msg.role === "user" && Array.isArray(msg.content)) {
-			const entry = index.entries[userKey(msg)];
-			if (entry) {
-				changed = true;
-				const content = (msg.content as AnyBlock[]).map((block) =>
-					block?.type === "image" ? { type: "text", text: entry.refText } : block,
-				);
-				out.push({ ...msg, content });
-				continue;
-			}
-			out.push(msg);
-			continue;
-		}
-
-		out.push(msg);
+		const rewritten = rewriteMessage(msg, index, removeIds);
+		if (rewritten.changed) changed = true;
+		if (rewritten.message) out.push(rewritten.message);
 	}
 
 	return { messages: out, changed };

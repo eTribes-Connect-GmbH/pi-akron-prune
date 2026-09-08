@@ -28,8 +28,16 @@ export interface AkronConfig {
   enabled: boolean;
   /** Footer status widget with the pending backlog. */
   showStatus: boolean;
-  /** Newest N eligible batches always stay in context, verbatim. */
+  /** Maximum number of newest eligible batches in the protected working set. */
   newestBatches: number;
+  /** Approximate character budget for that protected working set. */
+  workingSetChars: number;
+  /** Newest batches kept even when one batch exceeds the working-set budget. */
+  minWorkingSetBatches: number;
+  /** Context-pressure trigger: start pruning when remaining capacity drops below this fraction. */
+  pressureTriggerRemainingRatio: number;
+  /** Context-pressure target: select enough content to recover this remaining-capacity fraction. */
+  pressureTargetRemainingRatio: number;
   /** Standard trigger: minimum number of pending batches. */
   minPendingBatches: number;
   /** Standard trigger: minimum pending characters. */
@@ -66,6 +74,10 @@ export const DEFAULT_CONFIG: AkronConfig = {
   enabled: true,
   showStatus: true,
   newestBatches: 16,
+  workingSetChars: 320_000,
+  minWorkingSetBatches: 2,
+  pressureTriggerRemainingRatio: 0.12,
+  pressureTargetRemainingRatio: 0.2,
   minPendingBatches: 4,
   minPendingChars: 256_000,
   triggerItems: 64,

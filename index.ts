@@ -40,7 +40,7 @@ import {
 	saveConfig,
 	type AkronConfig,
 } from "./config.js";
-import { computeBatches, pendingFrom, type AnyMessage } from "./batches.js";
+import { computeBatches, pendingFrom, type AnyMessage, type PendingOptions } from "./batches.js";
 import { applyIndex } from "./rewrite.js";
 import { runPrune } from "./prune.js";
 import { ArtifactStore } from "./store.js";
@@ -102,22 +102,59 @@ export default function (pi: ExtensionAPI) {
 		return computeBatches(messages, st.index, cfg).filter((b) => b.complete);
 	}
 
-	/** Standard + emergency trigger evaluation. */
-	function choosePrune(messages: AnyMessage[]): { batches: Batch[]; trigger: string } | null {
+	type ContextUsageLike = { tokens: number | null; contextWindow: number } | undefined;
+
+	function workingSetOpts(extra: PendingOptions = {}): PendingOptions {
+		return {
+			keepChars: cfg.workingSetChars,
+			minKeepBatches: cfg.minWorkingSetBatches,
+			...extra,
+		};
+	}
+
+	function pressureTargetChars(usage: ContextUsageLike): number | null {
+		if (!usage || usage.tokens === null || usage.contextWindow <= 0) return null;
+		const remainingTokens = Math.max(0, usage.contextWindow - usage.tokens);
+		const remainingRatio = remainingTokens / usage.contextWindow;
+		if (remainingRatio > cfg.pressureTriggerRemainingRatio) return null;
+		const targetRemainingTokens = Math.ceil(usage.contextWindow * cfg.pressureTargetRemainingRatio);
+		const deficitTokens = Math.max(0, targetRemainingTokens - remainingTokens);
+		return deficitTokens > 0 ? Math.ceil(deficitTokens * 3.5) : null;
+	}
+
+	function withRedundant(eligible: Batch[], pending: ReturnType<typeof pendingFrom>): ReturnType<typeof pendingFrom> {
+		if (pending.batches.length === 0) return pending;
+		return pendingFrom(eligible, cfg.newestBatches, workingSetOpts({ includeRedundant: true, targetChars: pending.chars }));
+	}
+
+	/** Context-pressure, standard, and emergency trigger evaluation. */
+	function choosePrune(messages: AnyMessage[], usage?: ContextUsageLike): { batches: Batch[]; trigger: string } | null {
 		const eligible = eligibleBatches(messages);
 
-		const emergency = pendingFrom(eligible, cfg.emergencyKeepBatches);
+		const emergency = pendingFrom(
+			eligible,
+			cfg.newestBatches,
+			workingSetOpts({ minKeepBatches: cfg.emergencyKeepBatches }),
+		);
 		if (emergency.batches.length > 0 && emergency.chars >= cfg.emergencyChars) {
-			return { batches: emergency.batches, trigger: "emergency" };
+			return { batches: withRedundant(eligible, emergency).batches, trigger: "emergency" };
 		}
 
-		const std = pendingFrom(eligible, cfg.newestBatches);
+		const targetChars = pressureTargetChars(usage);
+		if (targetChars !== null) {
+			const pressure = pendingFrom(eligible, cfg.newestBatches, workingSetOpts({ includeRedundant: true, targetChars }));
+			if (pressure.batches.length > 0) {
+				return { batches: pressure.batches, trigger: "pressure" };
+			}
+		}
+
+		const std = pendingFrom(eligible, cfg.newestBatches, workingSetOpts());
 		if (
 			std.batches.length >= cfg.minPendingBatches &&
 			std.chars >= cfg.minPendingChars &&
 			(std.items >= cfg.triggerItems || std.chars >= cfg.triggerChars)
 		) {
-			return { batches: std.batches, trigger: "standard" };
+			return { batches: withRedundant(eligible, std).batches, trigger: "standard" };
 		}
 		return null;
 	}
@@ -139,8 +176,11 @@ export default function (pi: ExtensionAPI) {
 		if (!st) return null;
 
 		const choice = force
-			? { batches: pendingFrom(eligibleBatches(messages), cfg.newestBatches).batches, trigger: "manual" }
-			: choosePrune(messages);
+			? {
+					batches: pendingFrom(eligibleBatches(messages), cfg.newestBatches, workingSetOpts({ includeRedundant: true })).batches,
+					trigger: "manual",
+				}
+			: choosePrune(messages, ctx.getContextUsage());
 		if (!choice || choice.batches.length === 0) return null;
 
 		return withLock(async () => {
@@ -183,7 +223,7 @@ export default function (pi: ExtensionAPI) {
 		const st = ensureState(ctx);
 		if (!st) return null;
 		const contextMessages = messages ?? messagesFromSession(ctx);
-		const pending = pendingFrom(eligibleBatches(contextMessages), cfg.newestBatches);
+		const pending = pendingFrom(eligibleBatches(contextMessages), cfg.newestBatches, workingSetOpts());
 		return formatStatusLine(pending, st.cacheRecords, ctx.getContextUsage());
 	}
 
@@ -299,7 +339,7 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			const messages = messagesFromSession(ctx);
-			const choice = choosePrune(messages);
+			const choice = choosePrune(messages, ctx.getContextUsage());
 			if (!choice) return;
 
 			const tokensBefore = event.preparation.tokensBefore;
@@ -326,7 +366,7 @@ export default function (pi: ExtensionAPI) {
 		name: "akron_recover",
 		label: "Recover pruned output",
 		description:
-			"Recover the original content of a pruned tool result, command, or uploaded image. " +
+			"Recover the original content of a pruned tool result, command, mutation args, or uploaded image. " +
 			"Pass the ref from a pruned placeholder (toolCallId or user key), or the artifact file path. " +
 			"Returns the original text and/or image content.",
 		promptSnippet: "Recover pruned tool output or images by ref or artifact path.",
@@ -341,7 +381,7 @@ export default function (pi: ExtensionAPI) {
 			const ref = String(params?.ref ?? "").trim();
 
 			let files: string[] = [];
-			const entry = st.index.entries[`tc:${ref}`] ?? st.index.entries[ref];
+			const entry = st.index.entries[`tc:${ref}`] ?? st.index.entries[`tc:${ref}:args`] ?? st.index.entries[ref];
 			if (entry) {
 				files = entry.files.map((f) => f.path);
 			} else {
@@ -437,14 +477,14 @@ export default function (pi: ExtensionAPI) {
 				);
 				if (st) {
 					const messages = messagesFromSession(ctx);
-					const pending = pendingFrom(eligibleBatches(messages), cfg.newestBatches);
+					const pending = pendingFrom(eligibleBatches(messages), cfg.newestBatches, workingSetOpts());
 					const footer = currentStatusLine(ctx, messages) ?? "unavailable";
 					updateStatus(ctx, messages);
 					lines.push(
 						`session: ${st.sessionId}`,
 						`footer: ${footer}`,
 						`cache records: ${st.cacheRecords.length} recent for this session`,
-						`pending: ${pending.batches.length} batches · ${pending.items} items · ${fmtK(pending.chars)} chars (window ${cfg.newestBatches})`,
+						`pending: ${pending.batches.length} batches · ${pending.items} items · ${fmtK(pending.chars)} chars (window ${cfg.newestBatches}, working set ${fmtK(cfg.workingSetChars)})`,
 						`pruned: ${Object.keys(st.index.entries).length} entries · ${st.index.checkpoints.length} checkpoints · ${fmtK(ArtifactStore.sessionSizeBytes(st.store.sessionDir))}B artifacts`,
 					);
 				} else {

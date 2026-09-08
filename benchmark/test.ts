@@ -62,9 +62,9 @@ check("percentile unsorted input", percentile([400, 100, 300, 200], 0.5) === 250
 
 // aggregation: sums, cache-hit ratio, retrieval, prune/compaction events
 const rows: TurnRow[] = [
-	row({ phase: "fill", wallMs: 1000 }),
-	row({ phase: "fill", wallMs: 2000, usage: { input: 2000, output: 20, cacheRead: 18_000, cacheWrite: 0, totalTokens: 20_020, cost: 0.02 } }),
-	row({ phase: "tail", wallMs: 500 }),
+	row({ phase: "fill", wallMs: 1000, contextTokens: 10_000, contextPercent: 10, recoverCalls: 1 }),
+	row({ phase: "fill", wallMs: 2000, contextTokens: 30_000, contextPercent: 30, recoverCalls: 2, usage: { input: 2000, output: 20, cacheRead: 18_000, cacheWrite: 0, totalTokens: 20_020, cost: 0.02 } }),
+	row({ phase: "tail", wallMs: 500, contextTokens: 20_000, contextPercent: 20 }),
 	row({ phase: "retrieve", wallMs: 400, retrievalCorrect: true }),
 	row({ phase: "retrieve", wallMs: 300, retrievalCorrect: null, failed: true }),
 ];
@@ -81,6 +81,9 @@ check(
 	Math.abs((summary.cacheHitRatio ?? 0) - 54_000 / 60_000) < 1e-9,
 	String(summary.cacheHitRatio),
 );
+check("aggregate max context tokens", summary.maxContextTokens === 30_000);
+check("aggregate max context percent", summary.maxContextPercent === 30);
+check("aggregate recovery calls", summary.recoverCalls === 3);
 check("aggregate median wall excludes failed", summary.medianWallMs === 750);
 check("aggregate fill median wall", summary.fillMedianWallMs === 1500);
 check("aggregate prune events", summary.pruneEvents === 3);
@@ -97,6 +100,8 @@ check("empty aggregate ratio null", empty.cacheHitRatio === null);
 const formatted = formatReport([summary]);
 check("report includes arm", formatted.includes("akron"));
 check("report includes hit percent", formatted.includes("90.0%"));
+check("report includes max context", formatted.includes("30k/30.0%"));
+check("report includes recovery count", formatted.includes(" 3 "));
 check("report includes retrieval score", formatted.includes("1/1"));
 
 // workload determinism: same seed → identical markers and prompt script

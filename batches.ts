@@ -104,12 +104,106 @@ export type AnyMessage = {
 	isError?: boolean;
 };
 
+function stableString(value: unknown): string {
+	try {
+		return JSON.stringify(value) ?? "";
+	} catch {
+		return String(value);
+	}
+}
+
+function hasLaterAssistant(messages: AnyMessage[], msgIndex: number): boolean {
+	for (let i = msgIndex + 1; i < messages.length; i++) {
+		if (messages[i]?.role === "assistant") return true;
+	}
+	return false;
+}
+
+function hasImageBlock(blocks: unknown[] | undefined): boolean {
+	return !!blocks?.some((b) => (b as { type?: string } | undefined)?.type === "image");
+}
+
+function mutationPath(item: BatchItem, cfg: AkronConfig): string | null {
+	if (item.kind !== "args" || item.isError || !cfg.mutationTools.includes(item.toolName ?? "")) return null;
+	const path = String((item.input as { path?: unknown } | undefined)?.path ?? "").trim();
+	return path || null;
+}
+
+function readSignature(item: BatchItem): string | null {
+	if (item.kind !== "result" || item.toolName !== "read") return null;
+	return `${stableString(item.input)}:${item.chars}:${djb2(stableString(item.blocks ?? []))}`;
+}
+
+function markConsumedEvidence(messages: AnyMessage[], batches: Batch[], cfg: AkronConfig): void {
+	const readItems: Array<{ sig: string; item: BatchItem }> = [];
+	const mutationItems: Array<{ path: string; item: BatchItem }> = [];
+
+	for (const batch of batches) {
+		for (const item of batch.items) {
+			const sig = readSignature(item);
+			if (sig) readItems.push({ sig, item });
+
+			const path = mutationPath(item, cfg);
+			if (path && hasLaterAssistant(messages, item.msgIndex)) mutationItems.push({ path, item });
+
+			if (
+				item.kind === "result" &&
+				item.toolName === "agent_browser" &&
+				hasImageBlock(item.blocks) &&
+				hasLaterAssistant(messages, item.msgIndex)
+			) {
+				item.rewrite = "removePair";
+				item.pruneReason = "consumed-browser-screenshot";
+			}
+		}
+	}
+
+	const latestRead = new Map<string, BatchItem>();
+	for (const { sig, item } of readItems) {
+		const prev = latestRead.get(sig);
+		if (!prev || item.msgIndex > prev.msgIndex) latestRead.set(sig, item);
+	}
+	for (const { sig, item } of readItems) {
+		if (latestRead.get(sig) !== item && hasLaterAssistant(messages, item.msgIndex)) {
+			item.rewrite = "removePair";
+			item.pruneReason = "repeated-read";
+		}
+	}
+
+	const seenPaths = new Set<string>();
+	mutationItems.sort((a, b) => b.item.msgIndex - a.item.msgIndex);
+	for (const { path, item } of mutationItems) {
+		if (seenPaths.has(path)) {
+			item.rewrite = "removePair";
+			item.pruneReason = "superseded-mutation";
+		} else {
+			seenPaths.add(path);
+		}
+	}
+
+	const removePairs = new Map<string, string>();
+	for (const batch of batches) {
+		for (const item of batch.items) {
+			if (item.rewrite === "removePair" && item.toolCallId) removePairs.set(item.toolCallId, item.pruneReason ?? "remove-pair");
+		}
+	}
+	for (const batch of batches) {
+		for (const item of batch.items) {
+			const reason = item.toolCallId ? removePairs.get(item.toolCallId) : undefined;
+			if (reason) {
+				item.rewrite = "removePair";
+				item.pruneReason = item.pruneReason ?? reason;
+			}
+		}
+	}
+}
+
 /**
  * Computes all batches that still contain prunable content. Each batch:
  *   - anchors at the assistant message that issued the tool calls (its
  *     first toolCall id), or at the user message that uploaded images
- *   - is "complete" only when at least one message follows its last item,
- *     which protects the in-flight tail of the current turn
+ *   - is "complete" only once a later assistant message has consumed it,
+ *     which protects unprocessed tool output and user images
  */
 export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: AkronConfig): Batch[] {
 	const last = messages.length - 1;
@@ -195,7 +289,7 @@ export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: A
 				if (cfg.mutationTools.includes(info.name)) {
 					prunable = aChars >= cfg.minResultChars;
 				} else if (info.name === "bash" && typeof (input as { command?: unknown })?.command === "string") {
-					prunable = ((input as { command: string }).command).length > cfg.stubBashArgsOver;
+					prunable = (input as { command: string }).command.length > cfg.stubBashArgsOver;
 				}
 				if (prunable) {
 					batch.items.push({
@@ -207,6 +301,7 @@ export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: A
 						msgIndex: info.msgIndex,
 						argsMsgIndex: info.msgIndex,
 						chars: aChars,
+						isError: !!m.isError,
 					});
 				}
 			}
@@ -239,19 +334,84 @@ export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: A
 
 	for (const b of batches) {
 		b.chars = b.items.reduce((s, item) => s + item.chars, 0);
-		b.complete = b.lastMsgIndex < last;
+		b.complete = b.lastMsgIndex < last && hasLaterAssistant(messages, b.lastMsgIndex);
 	}
+	markConsumedEvidence(messages, batches, cfg);
 
 	return batches;
 }
 
-/** Splits eligible batches into the pending set, keeping the newest `window` intact. */
-export function pendingFrom(eligible: Batch[], window: number): PendingInfo {
-	const keep = Math.max(0, Math.min(window, eligible.length));
-	const pending = eligible.slice(0, eligible.length - keep);
+export interface PendingOptions {
+	/** Maximum protected working-set chars in the newest batch suffix. */
+	keepChars?: number;
+	/** Always keep at least this many newest batches, even if keepChars is exceeded. */
+	minKeepBatches?: number;
+	/** Select only enough oldest non-protected batches to reach this many chars. */
+	targetChars?: number;
+	/** Also select consumed redundant pair-removal items inside the protected suffix. */
+	includeRedundant?: boolean;
+}
+
+function recalc(batch: Batch): void {
+	batch.chars = batch.items.reduce((total, item) => total + item.chars, 0);
+	batch.lastMsgIndex = batch.items.reduce((last, item) => Math.max(last, item.msgIndex), batch.anchorMsgIndex);
+}
+
+function addBatch(target: Batch[], batch: Batch, items: BatchItem[]): void {
+	const selected = items.filter((item) => !target.some((b) => b.items.some((existing) => existing.key === item.key)));
+	if (selected.length === 0) return;
+	const copy: Batch = { ...batch, items: selected.slice() };
+	recalc(copy);
+	target.push(copy);
+}
+
+function protectedStartOf(eligible: Batch[], window: number, opts: PendingOptions): number {
+	const maxKeep = Math.max(0, Math.min(window, eligible.length));
+	const minKeep = Math.max(0, Math.min(opts.minKeepBatches ?? 0, eligible.length));
+	let kept = 0;
+	let keptChars = 0;
+	let start = eligible.length;
+
+	for (let i = eligible.length - 1; i >= 0; i--) {
+		const batch = eligible[i];
+		const mustKeep = kept < minKeep;
+		const underCount = kept < maxKeep;
+		const underBudget = opts.keepChars === undefined || keptChars + batch.chars <= opts.keepChars;
+		if (!mustKeep && (!underCount || !underBudget)) break;
+		kept++;
+		keptChars += batch.chars;
+		start = i;
+	}
+	return start;
+}
+
+/**
+ * Splits eligible batches into pending work. The newest suffix is protected
+ * by both count and optional size budget; redundant consumed evidence can be
+ * selected from that suffix when a prune event is already happening.
+ */
+export function pendingFrom(eligible: Batch[], window: number, opts: PendingOptions = {}): PendingInfo {
+	const protectedStart = protectedStartOf(eligible, window, opts);
+	const selected: Batch[] = [];
+	let selectedChars = 0;
+
+	for (let i = 0; i < protectedStart; i++) {
+		if (opts.targetChars !== undefined && selectedChars >= opts.targetChars) break;
+		addBatch(selected, eligible[i], eligible[i].items);
+		selectedChars += eligible[i].chars;
+	}
+
+	if (opts.includeRedundant) {
+		for (const batch of eligible) {
+			const redundant = batch.items.filter((item) => item.rewrite === "removePair");
+			addBatch(selected, batch, redundant);
+		}
+	}
+
+	selected.sort((a, b) => a.anchorMsgIndex - b.anchorMsgIndex);
 	return {
-		batches: pending,
-		chars: pending.reduce((s, b) => s + b.chars, 0),
-		items: pending.reduce((s, b) => s + b.items.length, 0),
+		batches: selected,
+		chars: selected.reduce((s, b) => s + b.chars, 0),
+		items: selected.reduce((s, b) => s + b.items.length, 0),
 	};
 }
