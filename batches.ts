@@ -11,6 +11,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { isAbsolute, resolve } from "node:path";
 import type { Batch, BatchItem, PendingInfo, PruneIndex } from "./types.js";
 import type { AkronConfig } from "./config.js";
 
@@ -89,10 +90,21 @@ export function argsChars(input: unknown): number {
  * remain verbatim in context — they stay useful as instructions and are
  * cheap relative to their value.
  */
-function isPreservedRead(toolName: string, input: unknown, cfg: AkronConfig): boolean {
+function readPath(input: unknown): string {
+	return String((input as { path?: string } | undefined)?.path ?? "");
+}
+
+function pathKey(path: string, cwd: string): string {
+	const p = path.trim();
+	if (!p) return "";
+	return (isAbsolute(p) ? resolve(p) : resolve(cwd, p)).toLowerCase();
+}
+
+function isPreservedRead(toolName: string, input: unknown, cfg: AkronConfig, mutatedMarkdownPaths: Set<string>, cwd: string): boolean {
 	if (toolName !== "read" || cfg.preserveReadExtensions.length === 0) return false;
-	const p = String((input as { path?: string } | undefined)?.path ?? "");
-	return cfg.preserveReadExtensions.some((ext) => p.toLowerCase().endsWith(ext));
+	const p = readPath(input).toLowerCase();
+	if (mutatedMarkdownPaths.has(pathKey(p, cwd))) return false;
+	return cfg.preserveReadExtensions.some((ext) => p.endsWith(ext));
 }
 
 /** Loose structural superset of pi's AgentMessage — see types.ts. */
@@ -218,7 +230,7 @@ function markConsumedEvidence(messages: AnyMessage[], batches: Batch[], cfg: Akr
  *   - is "complete" only once a later assistant message has consumed it,
  *     which protects unprocessed tool output and user images
  */
-export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: AkronConfig): Batch[] {
+export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: AkronConfig, cwd = process.cwd()): Batch[] {
 	const last = messages.length - 1;
 
 	// toolCallId → matching call block metadata for lossless pair removal
@@ -256,6 +268,7 @@ export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: A
 	}
 
 	const batchMap = new Map<number, Batch>();
+	const successfulMutations = new Set<string>();
 
 	const getToolBatch = (assistantIdx: number): Batch => {
 		let batch = batchMap.get(assistantIdx);
@@ -282,6 +295,14 @@ export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: A
 		return batch;
 	};
 
+	for (const m of messages) {
+		if (m?.role !== "toolResult" || !m.toolCallId || m.isError) continue;
+		const info = calls.get(m.toolCallId);
+		if (!info || !cfg.mutationTools.includes(info.name)) continue;
+		const p = readPath(info.input).toLowerCase();
+		if (p && cfg.preserveReadExtensions.some((ext) => p.endsWith(ext))) successfulMutations.add(pathKey(p, cwd));
+	}
+
 	for (let i = 0; i < messages.length; i++) {
 		const m = messages[i];
 
@@ -294,7 +315,7 @@ export function computeBatches(messages: AnyMessage[], index: PruneIndex, cfg: A
 
 			// 1) the tool result content itself
 			const resultKey = `tc:${m.toolCallId}`;
-			if (!index.entries[resultKey] && !isPreservedRead(info.name, input, cfg)) {
+			if (!index.entries[resultKey] && !isPreservedRead(info.name, input, cfg, successfulMutations, cwd)) {
 				const chars = contentChars(m.content);
 				if (chars >= cfg.minResultChars && (cfg.pruneErrors || !m.isError)) {
 					const item: BatchItem = {

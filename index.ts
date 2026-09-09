@@ -126,10 +126,10 @@ export default function (pi: ExtensionAPI) {
 
 	// ── helpers ──────────────────────────────────────────────────────────
 
-	function eligibleBatches(messages: AnyMessage[]): Batch[] {
+	function eligibleBatches(messages: AnyMessage[], cwd: string): Batch[] {
 		const st = state;
 		if (!st) return [];
-		return computeBatches(messages, st.index, cfg).filter((b) => b.complete);
+		return computeBatches(messages, st.index, cfg, cwd).filter((b) => b.complete);
 	}
 
 	type ContextUsageLike = { tokens: number | null; contextWindow: number } | undefined;
@@ -177,8 +177,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/** Context-pressure, standard, and emergency trigger evaluation. */
-	function choosePrune(messages: AnyMessage[], usage?: ContextUsageLike): { batches: Batch[]; trigger: string } | null {
-		const eligible = eligibleBatches(messages);
+	function choosePrune(messages: AnyMessage[], cwd: string, usage?: ContextUsageLike): { batches: Batch[]; trigger: string } | null {
+		const eligible = eligibleBatches(messages, cwd);
 
 		const emergency = pendingFrom(
 			eligible,
@@ -226,10 +226,10 @@ export default function (pi: ExtensionAPI) {
 
 		const choice = force
 			? {
-					batches: pendingFrom(eligibleBatches(messages), cfg.newestBatches, workingSetOpts({ includeRedundant: true })).batches,
+					batches: pendingFrom(eligibleBatches(messages, ctx.cwd), cfg.newestBatches, workingSetOpts({ includeRedundant: true })).batches,
 					trigger: "manual",
 				}
-			: choosePrune(messages, ctx.getContextUsage());
+			: choosePrune(messages, ctx.cwd, ctx.getContextUsage());
 		if (!choice || choice.batches.length === 0) return null;
 
 		return withLock(async () => {
@@ -277,7 +277,7 @@ export default function (pi: ExtensionAPI) {
 		const st = ensureState(ctx);
 		if (!st) return null;
 		const contextMessages = messages ?? messagesFromSession(ctx);
-		const pending = pendingFrom(eligibleBatches(contextMessages), cfg.newestBatches, workingSetOpts());
+		const pending = pendingFrom(eligibleBatches(contextMessages, ctx.cwd), cfg.newestBatches, workingSetOpts());
 		return formatStatusLine(pending, st.cacheRecords, ctx.getContextUsage());
 	}
 
@@ -529,7 +529,7 @@ export default function (pi: ExtensionAPI) {
 				);
 				if (st) {
 					const messages = messagesFromSession(ctx);
-					const pending = pendingFrom(eligibleBatches(messages), cfg.newestBatches, workingSetOpts());
+					const pending = pendingFrom(eligibleBatches(messages, ctx.cwd), cfg.newestBatches, workingSetOpts());
 					const footer = currentStatusLine(ctx, messages) ?? "unavailable";
 					updateStatus(ctx, messages);
 					lines.push(

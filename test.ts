@@ -12,6 +12,7 @@
  * an LLM in the loop.
  */
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -192,7 +193,51 @@ check("working-set budget prunes within recent window", budgetPending.batches.ma
 const targetPending = pendingFrom(fakeBatches, 4, { keepChars: 250, minKeepBatches: 1, targetChars: 150 });
 check("pressure target selects enough eligible content", targetPending.batches.map((b) => b.anchorKey).join(",") === "b1,b2");
 
-console.log("7. redundant recent removal");
+console.log("7. mutated Markdown workspace snapshot");
+const mdRoot = mkdtempSync(join(tmpdir(), "akron-md-"));
+execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: mdRoot });
+execFileSync("git", ["config", "user.email", "akron@example.test"], { cwd: mdRoot });
+execFileSync("git", ["config", "user.name", "Akron Test"], { cwd: mdRoot });
+writeFileSync(join(mdRoot, "AGENTS.md"), "old instructions\n");
+execFileSync("git", ["add", "AGENTS.md"], { cwd: mdRoot });
+execFileSync("git", ["commit", "--quiet", "-m", "initial"], { cwd: mdRoot });
+const latestAgents = `latest complete instructions\n${"do not lose this\n".repeat(20)}`;
+writeFileSync(join(mdRoot, "AGENTS.md"), latestAgents);
+const mdMessages: AnyMessage[] = [
+	{ role: "user", content: "update instructions", timestamp: 40 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "md-edit", name: "edit", arguments: { path: "./AGENTS.md", edits: [{ oldText: "old", newText: "new".repeat(200) }] } }], timestamp: 41 },
+	{ role: "toolResult", toolCallId: "md-edit", toolName: "edit", content: [{ type: "text", text: "updated" }], isError: false, timestamp: 42 },
+	{ role: "assistant", content: [{ type: "text", text: "mutation consumed" }], timestamp: 43 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "md-read", name: "read", arguments: { path: "AGENTS.md" } }], timestamp: 44 },
+	{ role: "toolResult", toolCallId: "md-read", toolName: "read", content: [{ type: "text", text: latestAgents }], isError: false, timestamp: 45 },
+	{ role: "assistant", content: [{ type: "text", text: "read consumed" }], timestamp: 46 },
+];
+const mdStore = ArtifactStore.open(mdRoot, "md-session");
+const mdIndex = mdStore.loadIndex("md-session");
+const mdBatches = computeBatches(mdMessages, mdIndex, cfg, mdRoot);
+check("mutated AGENTS.md read becomes prunable", mdBatches.some((b) => b.anchorKey === "md-read"));
+await runPrune({ store: mdStore, index: mdIndex, cfg, batches: pendingFrom(mdBatches, 0).batches, cwd: mdRoot, sessionId: "md-session", trigger: "markdown-test" });
+const mdRewrite = applyIndex(mdMessages, mdIndex).messages;
+check("mutated AGENTS.md read was replaced", ((mdRewrite.find((m) => m.toolCallId === "md-read")?.content as Array<{ text?: string }> | undefined)?.[0]?.text ?? "").includes("akron-pruned"));
+check("checkpoint includes complete latest AGENTS.md", mdIndex.checkpoints[0]?.text.includes("Latest AGENTS.md (complete") && mdIndex.checkpoints[0]?.text.includes(latestAgents));
+rmSync(mdRoot, { recursive: true, force: true });
+
+const outsideRoot = mkdtempSync(join(tmpdir(), "akron-outside-"));
+const outsidePath = join(tmpdir(), `akron-outside-${process.pid}.txt`);
+const outsideMessages: AnyMessage[] = [
+	{ role: "user", content: "outside mutation", timestamp: 50 },
+	{ role: "assistant", content: [{ type: "toolCall", id: "outside-write", name: "write", arguments: { path: outsidePath, content: BIG } }], timestamp: 51 },
+	{ role: "toolResult", toolCallId: "outside-write", toolName: "write", content: [{ type: "text", text: "updated" }], isError: false, timestamp: 52 },
+	{ role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 53 },
+];
+const outsideStore = ArtifactStore.open(outsideRoot, "outside-session");
+const outsideIndex = outsideStore.loadIndex("outside-session");
+const outsideBatches = computeBatches(outsideMessages, outsideIndex, cfg);
+await runPrune({ store: outsideStore, index: outsideIndex, cfg, batches: pendingFrom(outsideBatches, 0).batches, cwd: outsideRoot, sessionId: "outside-session", trigger: "outside-test" });
+check("checkpoint reports outside-git mutation", outsideIndex.checkpoints[0]?.text.includes("outside git mutations") && outsideIndex.checkpoints[0]?.text.includes(outsidePath));
+rmSync(outsideRoot, { recursive: true, force: true });
+
+console.log("8. redundant recent removal");
 const SCREENSHOT = Buffer.alloc(5000, 7).toString("base64");
 const redundantMessages: AnyMessage[] = [
 	{ role: "user", content: "repeat and mutate", timestamp: 20 },
@@ -256,7 +301,7 @@ check("consumed browser screenshot pair removed", !redundantRewrite.some((m) => 
 check("assistant reasoning remains", redundantRewrite.some((m) => JSON.stringify(m.content).includes("processed first read")));
 rmSync(redundantRoot, { recursive: true, force: true });
 
-console.log("8. removed mutation pair with short result remains recoverable");
+console.log("9. removed mutation pair with short result remains recoverable");
 const smallRoot = mkdtempSync(join(tmpdir(), "akron-small-mutation-"));
 const smallStore = ArtifactStore.open(smallRoot, "small-mutation-session");
 const smallIndex = smallStore.loadIndex("small-mutation-session");
@@ -278,7 +323,7 @@ const smallRewrite = applyIndex(smallMutationMessages, smallIndex).messages;
 check("short-result mutation pair removed", !smallRewrite.some((m) => m.toolCallId === "sw1") && !JSON.stringify(smallRewrite).includes('"id":"sw1"'));
 rmSync(smallRoot, { recursive: true, force: true });
 
-console.log("9. failed mutations are not supersession evidence");
+console.log("10. failed mutations are not supersession evidence");
 const failedRoot = mkdtempSync(join(tmpdir(), "akron-failed-mutation-"));
 const failedStore = ArtifactStore.open(failedRoot, "failed-mutation-session");
 const failedIndex = failedStore.loadIndex("failed-mutation-session");
@@ -295,7 +340,7 @@ const failedPending = pendingFrom(computeBatches(failedMutationMessages, failedI
 check("failed later mutation does not supersede earlier mutation", failedPending.items === 0, `got ${failedPending.items}`);
 rmSync(failedRoot, { recursive: true, force: true });
 
-console.log("10. signed tool turns remain provider-valid");
+console.log("11. signed tool turns remain provider-valid");
 const signedRoot = mkdtempSync(join(tmpdir(), "akron-signed-turn-"));
 const signedStore = ArtifactStore.open(signedRoot, "signed-turn-session");
 const signedIndex = signedStore.loadIndex("signed-turn-session");
@@ -319,7 +364,7 @@ check("legacy signed call rewrite remains verbatim", signedCall?.arguments?.path
 check("legacy signed tool result remains paired", signedRewrite.some((message) => message.toolCallId === "sg1"));
 rmSync(signedRoot, { recursive: true, force: true });
 
-console.log("11. recovery");
+console.log("12. recovery");
 const blocks = store.readArtifactBlocks(t3Entry.files[0].path);
 check("text artifact recovers as text block", blocks.length === 1 && blocks[0].type === "text" && blocks[0].text === BIG);
 const imgBlocks = store.readArtifactBlocks(imgEntry.files[0].path);
@@ -340,7 +385,7 @@ writeFileSync(legacyPath, legacyData);
 const legacyFile = { path: legacyPath, bytes: legacyData.length, sha256: createHash("sha256").update(legacyData).digest("hex") };
 check("legacy artifact bundles remain readable", JSON.stringify(store.readArtifactBlocks(legacyFile)) === JSON.stringify(orderedBlocks));
 
-console.log("11. integrity validation");
+console.log("13. integrity validation");
 const sharedIndex = store.loadIndex("shared-validation");
 const sharedArtifact = { ...t3Entry.files[0] };
 sharedIndex.entries.bad = { kind: "result", toolCallId: "bad", ts: 1, files: [{ ...sharedArtifact, sha256: "0".repeat(64) }], refText: "bad", prunedChars: 1 };
@@ -355,7 +400,7 @@ const afterDrop = applyIndex(messages, index);
 const t3ResultRestored = afterDrop.messages.find((m) => m.role === "toolResult" && m.toolCallId === "t3");
 check("dropped entry falls back to original in context", t3ResultRestored === messages[6]);
 
-console.log("12. cache profiling stats");
+console.log("14. cache profiling stats");
 const cacheRecord = buildCacheProfileRecord(
 	{
 		role: "assistant",

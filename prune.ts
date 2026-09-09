@@ -13,7 +13,7 @@
  * item instead of silently discarding the original.
  */
 
-import { gitSnapshot } from "./checkpoint.js";
+import { workspaceSnapshot } from "./workspaceSnapshot.js";
 import { argsChars, sanitizeId } from "./batches.js";
 import { appendProfile, type ArtifactStore } from "./store.js";
 import type { AkronConfig } from "./config.js";
@@ -188,9 +188,11 @@ export async function runPrune(opts: {
 	};
 
 	let firstAnchor: string | null = null;
+	const snapshotBatches: Batch[] = [];
 
 	for (const batch of batches) {
 		let batchPruned = 0;
+		const snapshotItems: BatchItem[] = [];
 		for (const item of batch.items) {
 			try {
 				const { entry } = await pruneItem(item, store, cfg, t0);
@@ -199,6 +201,7 @@ export async function runPrune(opts: {
 				stats.charsPruned += item.chars;
 				stats.charsAdded += entry.rewrite === "removePair" ? 0 : entry.refText.length + (entry.stubArgs ? argsChars(entry.stubArgs) : 0);
 				batchPruned++;
+				snapshotItems.push(item);
 			} catch {
 				// verification failed or write error: keep the original in context
 				stats.failures++;
@@ -207,15 +210,16 @@ export async function runPrune(opts: {
 		if (batchPruned > 0) {
 			stats.batches++;
 			if (!firstAnchor) firstAnchor = batch.anchorKey;
+			snapshotBatches.push({ ...batch, items: snapshotItems });
 		}
 	}
 
 	if (stats.items > 0 && firstAnchor) {
-		const gitText = await gitSnapshot(cwd);
+		const snapshot = await workspaceSnapshot(cwd, snapshotBatches);
 		const text =
 			`[akron checkpoint — ${stats.items} tool outputs (~${fmtK(stats.charsPruned)} chars) pruned from ` +
 			`${stats.batches} batches; originals are durable artifacts, recoverable via the akron_recover tool. ` +
-			`Workspace state at prune time — ${gitText}]`;
+			`Workspace state at prune time:\n\n${snapshot}]`;
 		index.checkpoints.push({ anchorKey: firstAnchor, ts: t0, text });
 		if (index.checkpoints.length > cfg.maxCheckpoints) {
 			index.checkpoints.splice(0, index.checkpoints.length - cfg.maxCheckpoints);
@@ -234,7 +238,7 @@ export async function runPrune(opts: {
 			charsAdded: stats.charsAdded,
 			failures: stats.failures,
 			durationMs: stats.durationMs,
-			git: gitText.slice(0, 200),
+			workspace: snapshot.slice(0, 200),
 		});
 	}
 
